@@ -1,0 +1,11 @@
+{
+  "name": "Bogotá Bici",
+  "short_name": "Bogotá Bici",
+  "description": "Rutas en bici por Bogotá con tipo de vía por tramo y reportes de la comunidad.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#E9ECE6",
+  "theme_color": "#0F766E",
+  "lang": "es",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
