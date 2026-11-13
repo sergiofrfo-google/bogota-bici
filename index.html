@@ -15,38 +15,58 @@
 <body>
   <div id="map"></div>
 
+  <div class="topbar">
   <!-- Origin / destination -->
   <form id="search" class="card search" autocomplete="off">
     <div class="field">
       <span class="dot dot-a" aria-hidden="true"></span>
-      <label class="sr" for="from">Origen</label>
-      <input id="from" placeholder="Origen (o toca el mapa)" enterkeyhint="search" />
-      <button type="button" id="gps" class="mini" aria-label="Usar mi ubicación como origen">
+      <label class="sr" for="from" data-i18n="Origen">Origen</label>
+      <input id="from" placeholder="Origen (o toca el mapa)" data-i18n-ph="Origen (o toca el mapa)" enterkeyhint="search" />
+      <button type="button" id="gps" class="mini" aria-label="Usar mi ubicación como origen" data-i18n-aria="Usar mi ubicación como origen">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+      </button>
+    </div>
+    <div class="field" id="viaRow" hidden>
+      <span class="dot dot-v" aria-hidden="true"></span>
+      <label class="sr" for="via" data-i18n="Pasar por">Pasar por</label>
+      <input id="via" placeholder="Pasar por: calle o lugar" data-i18n-ph="Pasar por: calle o lugar" enterkeyhint="search" />
+      <button type="button" id="viaClear" class="mini" aria-label="Quitar punto de paso" data-i18n-aria="Quitar punto de paso">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
       </button>
     </div>
     <div class="field">
       <span class="dot dot-b" aria-hidden="true"></span>
-      <label class="sr" for="to">Destino</label>
-      <input id="to" placeholder="Destino (o toca el mapa)" enterkeyhint="search" />
+      <label class="sr" for="to" data-i18n="Destino">Destino</label>
+      <input id="to" placeholder="Destino (o toca el mapa)" data-i18n-ph="Destino (o toca el mapa)" enterkeyhint="search" />
     </div>
-    <button type="button" id="swap" class="square" aria-label="Intercambiar origen y destino">
+    <button type="button" id="swap" class="square" aria-label="Intercambiar origen y destino" data-i18n-aria="Intercambiar origen y destino">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16M7 4L3 8M7 4l4 4M17 20V4M17 20l-4-4M17 20l4-4"/></svg>
     </button>
     <ul id="suggest" class="suggest" hidden></ul>
   </form>
 
-  <!-- Floating buttons -->
-  <div class="fabs">
-    <button id="layersBtn" class="square float" aria-label="Capas y opciones">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
-    </button>
-    <button id="reportFab" class="square float" aria-label="Reportar un problema">
-      <svg viewBox="0 0 24 24" aria-hidden="true" style="color:#B45309"><path d="M12 3L2 20h20L12 3z"/><path d="M12 10v4M12 17h.01"/></svg>
-    </button>
-    <button id="locateBtn" class="square float" aria-label="Mostrar mi ubicación">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l7 19-7-4-7 4 7-19z"/></svg>
-    </button>
+  <div class="under">
+    <!-- The two other main functions besides routing: places for cyclists, and reporting problems -->
+    <div id="quick" class="quick">
+      <button id="svcBtn" class="chip" type="button" data-i18n="Talleres y aire">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4 2.6-2.6z"/></svg>
+        Talleres y aire
+      </button>
+      <button id="reportFab" class="chip warnchip" type="button" data-i18n="Reportar problema">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3L2 20h20L12 3z"/><path d="M12 10v4M12 17h.01"/></svg>
+        Reportar problema
+      </button>
+    </div>
+    <!-- Floating buttons -->
+    <div class="fabs">
+      <button id="layersBtn" class="square float" aria-label="Capas y opciones" data-i18n-aria="Capas y opciones">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>
+      </button>
+      <button id="locateBtn" class="square float" aria-label="Mostrar mi ubicación" data-i18n-aria="Mostrar mi ubicación">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l7 19-7-4-7 4 7-19z"/></svg>
+      </button>
+    </div>
+  </div>
   </div>
 
   <!-- Report placement pin -->
@@ -56,7 +76,7 @@
 
   <!-- Bottom sheet: content swapped by app.js; drag the handle (or the content) to resize -->
   <section id="sheet" class="sheet" hidden aria-live="polite">
-    <button class="grab" type="button" aria-label="Expandir o contraer"><span class="handle"></span></button>
+    <button class="grab" type="button" aria-label="Expandir o contraer" data-i18n-aria="Expandir o contraer"><span class="handle"></span></button>
     <div id="sheetBody"></div>
   </section>
 
@@ -69,21 +89,21 @@
       </div>
       <div id="navNext" class="navnext" hidden></div>
     </div>
-    <button id="navRecenter" class="pill-btn float" hidden>
+    <button id="navRecenter" class="pill-btn float" hidden data-i18n="Centrar">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l7 19-7-4-7 4 7-19z"/></svg> Centrar
     </button>
     <div id="navBottom" class="navbottom">
       <div id="navType" class="navtype"></div>
       <div class="navrow">
-        <button id="navExit" class="square exit" aria-label="Salir de la navegación">
+        <button id="navExit" class="square exit" aria-label="Salir de la navegación" data-i18n-aria="Salir de la navegación">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
         <div class="navstats"><b id="navTime"></b><span id="navRest"></span></div>
-        <button id="navReport" class="square" aria-label="Reportar un problema aquí">
+        <button id="navReport" class="square" aria-label="Reportar un problema aquí" data-i18n-aria="Reportar un problema aquí">
           <svg viewBox="0 0 24 24" aria-hidden="true" style="color:#B45309"><path d="M12 3L2 20h20L12 3z"/><path d="M12 10v4M12 17h.01"/></svg>
         </button>
-        <button id="navVoice" class="square" aria-label="Activar o silenciar la voz"></button>
-        <button id="navOverview" class="square" aria-label="Ver toda la ruta">
+        <button id="navVoice" class="square" aria-label="Activar o silenciar la voz" data-i18n-aria="Activar o silenciar la voz"></button>
+        <button id="navOverview" class="square" aria-label="Ver toda la ruta" data-i18n-aria="Ver toda la ruta">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/></svg>
         </button>
       </div>
@@ -92,6 +112,7 @@
 
   <div id="toast" class="toast" hidden role="status"></div>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
