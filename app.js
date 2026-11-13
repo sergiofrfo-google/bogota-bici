@@ -880,8 +880,16 @@ function reportsNear(route) {
 }
 function startReport() {
   S.draftType = 'pothole';
-  if (N.lastPos) map.jumpTo({ center: N.lastPos });
+  // when coming from navigation, put the pin where the rider is (and don't let a pending refit move it)
+  const at = N.lastPos;
+  N.lastPos = null;
   show('report');
+  if (at) {
+    S.fit = null;
+    map.jumpTo({ center: at, zoom: Math.max(map.getZoom(), 17), bearing: 0, pitch: 0 });
+    const px = wide() ? (innerWidth + 450) / 2 : innerWidth / 2;
+    map.panBy([innerWidth / 2 - px, innerHeight / 2 - pinY()], { duration: 0 });
+  }
 }
 // the placement pin sits in the middle of the map area left visible between the search box and the sheet
 function pinY() {

@@ -165,6 +165,19 @@ const report = [], log = [];
   const after = await page.evaluate(() => N.route.id);
   check('off-route triggers reroute', after !== before, `${before} -> ${after}`);
   await shot('11-nav-rerouted');
+  // report from the road: pin must stay on the rider, then go back to navigating
+  {
+    const rider = await page.evaluate(() => { const p = pointAtDist(N.route, 1500); onPos({ coords: { longitude: p[0], latitude: p[1], accuracy: 5 } }); return p; });
+    await page.waitForTimeout(1200);
+    await page.tap('#navReport'); await page.waitForTimeout(1500);
+    const at = await page.evaluate(() => { const c = map.unproject([innerWidth / 2, pinY()]); return [c.lng, c.lat]; });
+    const d = await page.evaluate(([a, b]) => dist(a, b), [at, rider]);
+    check('report from navigation puts pin on the rider', d < 30, `${Math.round(d)} m`);
+    await page.tap('[data-act="cancelReport"]'); await page.waitForTimeout(600);
+    await page.tap('[data-act="nav"]'); await page.waitForTimeout(1200);
+    const pts2 = await page.evaluate(() => [1500, 2100].map((d) => pointAtDist(N.route, d)));
+    for (const p of pts2) { await offset(p[0], p[1]); await page.waitForTimeout(800); }
+  }
   // overview + recenter
   await page.tap('#navOverview'); await page.waitForTimeout(900); await shot('12-nav-overview');
   check('recenter shown after overview', await page.$eval('#navRecenter', (e) => !e.hidden));
