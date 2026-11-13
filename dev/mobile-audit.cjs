@@ -29,11 +29,31 @@ const report = [], log = [];
       const f = path.join(ML, path.basename(u.pathname));
       return route.fulfill({ status: 200, body: fs.readFileSync(f), headers: { 'content-type': types[path.extname(f)] } });
     }
+    if (/overpass/.test(u.host)) { // Overpass isn't reachable from the test machine: answer with a small fixture
+      const el = (id, lat, lon, tags) => ({ type: 'node', id, lat, lon, tags });
+      return route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ elements: [
+        el(1, 4.7178, -74.0372, { shop: 'bicycle', name: 'Taller cerca de A', opening_hours: 'Mo-Sa 08:00-18:00' }),
+        el(2, 4.6990, -74.0477, { amenity: 'compressed_air', name: 'Aire Cl 116' }),
+        el(3, 4.6800, -74.0825, { amenity: 'bicycle_repair_station' }),
+        el(4, 4.6640, -74.1105, { shop: 'tyres', name: 'Montallantas Salitre' }),
+        el(5, 4.6000, -74.2000, { shop: 'bicycle', name: 'Lejos de la ruta' }),
+      ] }) });
+    }
     if (/openstreetmap\.org$|openfreemap\.org$|komoot\.io$|overpass/.test(u.host) && !u.host.startsWith('nominatim')) return route.fulfill({ status: 404, body: '' });
+    // street search: recorded Nominatim answer for "Avenida Boyacá" (Nominatim limits repeated test runs)
+    if (u.host.startsWith('nominatim') && u.pathname === '/search' && /boyac/i.test(u.searchParams.get('q') || '')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: fs.readFileSync(path.join(__dirname, 'fixtures/nominatim-boyaca.json')) });
+    }
     try {
       const req = route.request();
+      // record/replay Nominatim and BRouter answers so repeated runs stay within their usage policies
+      const cacheDir = path.join(OUT, 'cache');
+      fs.mkdirSync(cacheDir, { recursive: true });
+      const ck = path.join(cacheDir, require('crypto').createHash('sha1').update(u.toString()).digest('hex'));
+      if (/nominatim|brouter/.test(u.host) && fs.existsSync(ck)) return route.fulfill({ status: 200, body: fs.readFileSync(ck), headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
       const r = await fetch(u, { method: req.method(), body: req.postData() || undefined, headers: { 'user-agent': 'bogota-bici-test' } });
       const body = Buffer.from(await r.arrayBuffer());
+      if (r.status === 200 && /nominatim|brouter/.test(u.host)) fs.writeFileSync(ck, body);
       return route.fulfill({ status: r.status, body, headers: { 'content-type': r.headers.get('content-type') || 'text/plain', 'access-control-allow-origin': '*' } });
     } catch (e) { log.push('NETFAIL ' + u.host + ' ' + e.message); return route.abort(); }
   });
@@ -93,6 +113,46 @@ const report = [], log = [];
   }
   await shot('03-route-infra');
 
+  // "Pasar por": route through a street typed by the user
+  {
+    const before = await page.evaluate(() => ({ len: cur().length, time: cur().time }));
+    await page.evaluate(() => document.querySelector('.tools [data-act="addVia"]').click());
+    await page.waitForTimeout(400);
+    await page.fill('#via', process.env.VIA || 'Avenida Boyacá');
+    await page.press('#via', 'Enter');
+    try { await page.waitForFunction(() => S.via && S.view === 'route' && cur(), null, { timeout: 60000 }); } catch (e) { report.push('VIA STATE ' + JSON.stringify(await page.evaluate(() => ({ via: S.via, view: S.view, val: $('via').value, row: $('viaRow').hidden, toast: $('toast').textContent, err: S.errorMsg })))); throw e; }
+    await page.waitForTimeout(1500);
+    const v = await page.evaluate(() => ({ label: S.via.label, street: S.via.street, n: S.via.pts.length, pts: S.via.pts.map((p) => p.map((x) => +x.toFixed(4))), len: cur().length, time: Math.round(cur().time / 60), maxOff: Math.round(Math.max(...S.via.pts.map((p) => distToLine(p, cur().coords)))), chips: document.querySelector('.chips').innerText.replace(/\n/g, ' | ') }));
+    report.push('via: ' + JSON.stringify(v) + ' before: ' + JSON.stringify(before));
+    check('route passes through the chosen street', v.street && v.maxOff < 60 && /Boyacá/.test(v.label), `max distance from via points to route ${v.maxOff} m`);
+    await shot('02b-via-boyaca');
+    const share = await page.evaluate(() => shareUrl());
+    report.push('share: ' + share);
+    check('share link keeps the via', /[?&]v=/.test(share) && /vn=/.test(share));
+    await page.tap('.vialine [data-act="clearVia"]');
+    await page.waitForFunction(() => !S.via && S.view === 'route' && cur(), null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    check('removing the via restores the route', await page.evaluate((l) => Math.abs(cur().length - l) < 50, before.len));
+  }
+  // places for cyclists: along the route, filters, place card, stop there
+  {
+    await page.tap('#svcBtn');
+    await page.waitForFunction(() => S.view === 'services' && !SV.loading, null, { timeout: 30000 });
+    await page.waitForTimeout(800);
+    const names = await page.$$eval('.svcrow', (els) => els.map((e) => e.innerText.replace(/\n/g, ' ')));
+    report.push('places on route: ' + names.join(' || '));
+    check('places along the route listed and far ones excluded', names.length === 3 && !names.some((n) => /Lejos/.test(n)));
+    await shot('03b-places-route');
+    await page.tap('[data-act="svcFilter"][data-k="tyre"]'); await page.waitForTimeout(400);
+    check('filter montallantas', (await page.$$('.svcrow')).length === 1);
+    await page.tap('.svcrow'); await page.waitForTimeout(900);
+    await shot('03c-place');
+    const btn = await page.$eval('#sheetBody', (e) => e.innerText);
+    check('place card offers stopping there', /Parar aquí en mi ruta/.test(btn));
+    await page.tap('[data-act="backServices"]'); await page.waitForTimeout(400);
+    await page.tap('[data-act="close"]'); await page.waitForTimeout(600);
+    check('markers removed after closing places', await page.evaluate(() => markers.services.length === 0 && S.view === 'route'));
+  }
   // tramos
   await page.tap('[data-act="steps"]');
   await page.waitForTimeout(800);
@@ -138,6 +198,30 @@ const report = [], log = [];
   await page.tap('[data-act="close"]'); await page.waitForTimeout(600);
   report.push('chips after calm pace: ' + (await page.$eval('.chips', (e) => e.innerText.replace(/\n/g, ' | '))));
 
+  // English: switch language, check route sheet, stretches and a turn instruction have no Spanish left
+  {
+    await page.tap('#layersBtn'); await page.waitForTimeout(500);
+    await page.tap('[data-act="lang"][data-k="en"]'); await page.waitForTimeout(400);
+    await shot('08b-options-en');
+    await page.tap('[data-act="close"]'); await page.waitForTimeout(700);
+    const routeTxt = await page.$eval('#sheetBody', (e) => e.innerText.replace(/\n/g, ' | '));
+    const quick = await page.$eval('#quick', (e) => e.innerText.replace(/\n/g, ' | '));
+    const ph = await page.$eval('#from', (e) => e.placeholder);
+    await page.tap('[data-act="steps"]'); await page.waitForTimeout(600);
+    await page.tap('[data-act="tab"][data-tab="turns"]'); await page.waitForTimeout(600);
+    const turnsTxt = await page.$eval('#sheetBody', (e) => e.innerText.replace(/\n/g, ' | ').slice(0, 400));
+    await shot('08c-directions-en');
+    report.push('EN route: ' + routeTxt);
+    report.push('EN quick: ' + quick + ' / placeholder: ' + ph);
+    report.push('EN turns: ' + turnsTxt);
+    const spanish = /\b(sin carros|Iniciar|Tramos|Gira|llegas|Mantente|Sigue|Pasar por|Compartir|Limpiar|Talleres|Reportar)\b/;
+    check('English mode has no Spanish UI text', !spanish.test(routeTxt + ' ' + quick + ' ' + turnsTxt), (routeTxt + ' ' + quick + ' ' + turnsTxt).match(spanish)?.[0] || '');
+    await page.tap('[data-act="back"]'); await page.waitForTimeout(500);
+    await page.tap('#layersBtn'); await page.waitForTimeout(500);
+    await page.tap('[data-act="lang"][data-k="es"]'); await page.waitForTimeout(300);
+    await page.tap('[data-act="close"]'); await page.waitForTimeout(700);
+    check('back to Spanish', /Iniciar/.test(await page.$eval('#sheetBody', (e) => e.innerText)));
+  }
   // report flow: pin must be visible above the sheet
   await page.tap('#reportFab'); await page.waitForTimeout(700);
   const pin = await page.evaluate(() => ({ pin: $('placePin').getBoundingClientRect().top, sheet: $('sheet').getBoundingClientRect().top, search: $('search').getBoundingClientRect().bottom }));

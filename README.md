@@ -8,7 +8,11 @@ Planeador de rutas en bici para Bogotá, gratis y comunitario.
 - Guarda tus rutas frecuentes, compártelas por enlace y ajusta tu ritmo (tranquilo, normal, rápido).
 - Cada tramo se marca como ciclorruta exclusiva, compartida con peatones, carril pintado o con carros.
 - Reporta huecos, cierres, conexiones faltantes, cruces peligrosos y zonas de robo, y confirma si "sigue ahí" o "ya está arreglado".
-- Capas: red oficial de ciclorrutas (IDU), talleres y bombas de aire.
+- **Pasar por**: escribe una calle (por ejemplo Avenida Boyacá) o mantén presionado el mapa para que la ruta pase por ahí; el punto se puede arrastrar.
+- **Talleres y aire**: talleres, montallantas, bombas de aire y estaciones de reparación cerca de ti o a lo largo de tu ruta, con botón para parar ahí.
+- Botón visible de **Reportar problema** en el mapa y durante la navegación.
+- Español e inglés (según el idioma del teléfono, se cambia en Capas y opciones).
+- Capa: red oficial de ciclorrutas (IDU).
 
 ## How it works
 
@@ -25,9 +29,9 @@ A static site: no build step, no server, no API keys. Open `index.html` through 
 
 Reports are stored only in the browser (localStorage) for now. `supabase/schema.sql` is the planned shared backend.
 
-Open a route directly with `?a=lat,lng&b=lat,lng&an=Name&bn=Name&m=infra|balanced|fast`.
+Open a route directly with `?a=lat,lng&b=lat,lng&an=Name&bn=Name&m=infra|balanced|fast`, plus `&v=lat,lng;lat,lng&vn=Name` for via points.
 Add `&sim=1` to replay the route instead of using GPS when testing navigation at a desk.
 
-`dev/mobile-audit.cjs` runs a phone-sized Playwright check (sheet drag, route fitting, tramos, navigation, reroute, arrival).
+`dev/mobile-audit.cjs` runs a phone-sized Playwright check (sheet drag, route fitting, tramos, navigation, reroute, arrival, via street, places, report, English).
 
 Map data © OpenStreetMap contributors.
