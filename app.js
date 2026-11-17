@@ -410,30 +410,41 @@ function clearAll() {
 }
 
 // ---------------------------------------------------------------- Nominatim (1 request per second, shared queue)
-let nomQueue = Promise.resolve();
+// One scheduler for every Nominatim call so searches and name lookups never share a second.
+// Searches go to the front of the line; street-name lookups wait behind them.
 const nomCache = new Map();
-// searches jump ahead of the street-name lookups so typing a place never waits behind a long list
-let nomPriority = Promise.resolve();
+const nomJobs = { hi: [], lo: [] };
+let nomBusy = false;
+function nomRun() {
+  if (nomBusy) return;
+  const job = nomJobs.hi.shift() || nomJobs.lo.shift();
+  if (!job) return;
+  nomBusy = true;
+  job().finally(() => setTimeout(() => { nomBusy = false; nomRun(); }, 1100));
+}
+function nomEnqueue(fn, hi) {
+  return new Promise((ok, fail) => {
+    nomJobs[hi ? 'hi' : 'lo'].push(() => fn().then(ok, fail));
+    nomRun();
+  });
+}
 function nomSearch(url) {
-  const p = nomPriority.then(async () => {
+  return nomEnqueue(async () => {
     const r = await fetchT(url, {}, 12000);
     if (r.status === 429) throw new Error('busy');
     if (!r.ok) throw new Error('Nominatim ' + r.status);
     return r.json();
-  });
-  nomPriority = p.catch(() => {}).then(() => new Promise((ok) => setTimeout(ok, 1100)));
-  return p;
+  }, true);
 }
 function nomReverse(lat, lng, zoom, poly) {
   const k = `${zoom}${poly ? 'p' : ''}:${lat.toFixed(5)},${lng.toFixed(5)}`;
   if (nomCache.has(k)) return nomCache.get(k);
-  const p = nomQueue.then(async () => {
+  const p = nomEnqueue(async () => {
     try {
       const r = await fetchT(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat.toFixed(6)}&lon=${lng.toFixed(6)}&zoom=${zoom}&accept-language=es${poly ? '&polygon_geojson=1&polygon_threshold=0.00003' : ''}`, {}, 8000);
       return await r.json();
     } catch { return null; }
-  });
-  nomQueue = p.then(() => new Promise((ok) => setTimeout(ok, 1100)));
+  }, false);
   nomCache.set(k, p);
   return p;
 }
@@ -519,7 +530,8 @@ async function streetVia(name) {
     return [best];
   }
   const pts = [entry];
-  const n = Math.floor(dist(entry, exit) / 2000);
+  // dense enough (every ~800 m) that the router can't leave the street between two points for long
+  const n = Math.floor(dist(entry, exit) / 800);
   for (let k = 1; k <= n; k++) {
     const t = k / (n + 1), target = [entry[0] + t * (exit[0] - entry[0]), entry[1] + t * (exit[1] - entry[1])];
     const q = nearestOnLines(target, lines);
@@ -940,7 +952,7 @@ function timeAgo(ts) {
 const isSaved = () => S.A && S.B && S.saved.some((s) => dist([s.A.lng, s.A.lat], [S.A.lng, S.A.lat]) < 30 && dist([s.B.lng, s.B.lat], [S.B.lng, S.B.lat]) < 30 && (s.via?.label || '') === (S.via?.label || ''));
 function saveRoute() {
   if (isSaved()) { toast(L('Esta ruta ya está en Mis rutas.')); return; }
-  S.saved.unshift({ A: S.A, B: S.B, via: S.via, mode: S.mode });
+  S.saved.unshift({ A: S.A, B: S.B, via: S.via && { ...S.via, pts: S.via.pts.map((q) => [...q]) }, mode: S.mode });
   S.saved = S.saved.slice(0, 12);
   LS.set('bb_saved', S.saved);
   toast(L('Ruta guardada. La verás en Mis rutas al abrir la app.'));
@@ -1509,7 +1521,7 @@ async function init() {
   $('swap').addEventListener('click', () => {
     const a = S.A, b = S.B;
     S.A = b; S.B = a;
-    if (S.via) { S.via.pts.reverse(); drawVia(); }
+    if (S.via) { S.via = { ...S.via, pts: [...S.via.pts].reverse() }; drawVia(); }
     for (const w of ['A', 'B']) { if (markers[w]) markers[w].remove(); markers[w] = null; if (S[w]) makeMarker(w, S[w]); }
     $('from').value = S.A?.label || ''; $('to').value = S.B?.label || '';
     if (S.A && S.B) computeRoutes();
