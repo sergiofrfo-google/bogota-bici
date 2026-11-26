@@ -1,0 +1,38 @@
+# Refreshes data/places.json (bike shops, air, repair stations, montallantas) from OpenStreetMap every week,
+# and publishes it to the live app (main and gh-pages) when something changed.
+name: Refresh places for cyclists
+
+on:
+  schedule:
+    - cron: '43 9 * * 1'   # Mondays, 4:43 AM in Bogotá
+  workflow_dispatch:
+  push:                    # also right after this job or the script change, to make the first snapshot
+    branches: [main]
+    paths: ['scripts/fetch-places.mjs', '.github/workflows/places.yml']
+
+permissions:
+  contents: write
+
+concurrency: places
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node scripts/fetch-places.mjs
+      - name: Publish if changed
+        run: |
+          if git diff --quiet -- data/places.json; then echo "No changes"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/places.json
+          git commit -m "Refresh places for cyclists from OpenStreetMap"
+          git push origin HEAD:main
+          git push origin HEAD:gh-pages
