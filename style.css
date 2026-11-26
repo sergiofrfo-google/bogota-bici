@@ -169,7 +169,7 @@ label.lbl { font-size: 13px; font-weight: 600; display: block; margin-bottom: 6p
 .vbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; gap: 2px; background: var(--soft); }
 
 .toggle { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--soft); font-size: 15px; }
-.toggle input { width: 22px; height: 22px; accent-color: var(--brand); }
+.toggle input { width: 22px; height: 22px; flex: none; accent-color: var(--brand); }
 .toggle .sw { width: 22px; height: 6px; }
 .toggle small { display: block; color: var(--muted); font-size: 12px; }
 
