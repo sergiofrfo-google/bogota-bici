@@ -1045,14 +1045,14 @@ function openRoute(A, B, via) {
 // add_report and vote_report (see supabase/schema.sql), never read or change the tables directly.
 const SB = { url: 'https://xyxalfmyethcsyrurmkf.supabase.co/rest/v1/rpc/', key: 'sb_publishable_lqEWRpuUlZsWYmGzqmSUlQ_lmz2yuEV' };
 // a random id for this phone: one vote per phone per report, and a posting limit per phone
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = (Math.random() * 16) | 0; return (c === 'x' ? r : (r & 3) | 8).toString(16); }));
 const DEVICE = (() => {
   let d = LS.get('bb_device', null);
-  if (!/^[0-9a-f-]{36}$/.test(d || '')) {
-    d = crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = (Math.random() * 16) | 0; return (c === 'x' ? r : (r & 3) | 8).toString(16); });
-    LS.set('bb_device', d);
-  }
+  if (!/^[0-9a-f-]{36}$/.test(d || '')) { d = uuid(); LS.set('bb_device', d); }
   return d;
 })();
+// cid: made on the phone, so sending the same report twice (lost answer, retry) never creates a duplicate
+const addArgs = (r) => ({ p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE, p_client_id: r.cid || (r.cid = uuid()) });
 async function sbCall(fn, body) {
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 12000);
   try {
@@ -1090,7 +1090,7 @@ async function syncReports() {
       try {
         if (o.kind === 'add') {
           const r = o.report;
-          const id = await sbCall('add_report', { p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE });
+          const id = await sbCall('add_report', addArgs(r));
           remember(id, 'still');
         } else if (!String(o.id).startsWith('r')) {
           await sbCall('vote_report', { p_report: o.id, p_vote: o.vote, p_device: DEVICE });
@@ -1113,9 +1113,10 @@ async function syncReports() {
     }
   } catch { /* offline: keep showing the last download */ } finally { syncing = false; }
 }
+// the server already drops old reports (60 days after posting or the last "still there"); this only
+// applies a phone's own fresh "fixed" vote right away
 function activeReports() {
-  const days60 = 60 * 864e5;
-  return S.reports.filter((r) => !(r.fixed >= 3 && r.fixed > r.still) && Date.now() - r.created < days60);
+  return S.reports.filter((r) => !(r.fixed >= 3 && r.fixed > r.still));
 }
 function reportsNear(route) {
   if (!route) return [];
@@ -1143,12 +1144,12 @@ function pinY() {
 function placePin() { if (S.view === 'report') { $('placePin').style.top = pinY() + 'px'; $('placePin').style.left = (wide() ? (innerWidth + 450) / 2 : innerWidth / 2) + 'px'; } }
 async function publishReport() {
   const c = map.unproject([wide() ? (innerWidth + 450) / 2 : innerWidth / 2, pinY()]);
-  const r = { id: 'r' + Date.now(), type: S.draftType, note: ($('note')?.value || '').trim().slice(0, 280), lng: c.lng, lat: c.lat, created: Date.now(), still: 1, fixed: 0, myVote: 'still' };
+  const r = { id: 'r' + Date.now(), cid: uuid(), type: S.draftType, note: ($('note')?.value || '').trim().slice(0, 280), lng: c.lng, lat: c.lat, created: Date.now(), still: 1, fixed: 0, myVote: 'still' };
   if (r.lat < BBOX.s || r.lat > BBOX.n || r.lng < BBOX.w || r.lng > BBOX.e) { toast(L('Solo se pueden reportar sitios en Bogotá.')); return; }
   S.reports.push(r); drawReports();
   show(cur() ? 'route' : null);
   try {
-    const id = await sbCall('add_report', { p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE });
+    const id = await sbCall('add_report', addArgs(r));
     r.id = id; remember(id, 'still'); saveReports(); drawReports();
     toast(L('Reporte publicado. Todos los ciclistas lo verán. ¡Gracias!'));
   } catch (e) {
@@ -1165,7 +1166,13 @@ function vote(v) {
   r[v] += 1; r.myVote = v; remember(r.id, v); saveReports(); drawReports(); rerender();
   if (r.pending) return; // its "still there" goes with the report itself
   sbCall('vote_report', { p_report: r.id, p_vote: v, p_device: DEVICE })
-    .catch((e) => { if (!e.status || e.status >= 500) queue({ kind: 'vote', id: r.id, vote: v }); });
+    .catch((e) => {
+      if (!e.status || e.status >= 500) { queue({ kind: 'vote', id: r.id, vote: v }); return; }
+      // refused (e.g. too many votes this hour): undo it so the rider can vote again later
+      r[v] -= 1; r.myVote = null; const m = LS.get('bb_votes', {}); delete m[r.id]; LS.set('bb_votes', m);
+      saveReports(); drawReports(); rerender();
+      toast(L(/rate_limited/.test(e.message) ? 'Has votado muchas veces seguidas. Intenta más tarde.' : 'No se pudo guardar tu voto.'));
+    });
 }
 function drawReports() {
   markers.reports.forEach((m) => m.remove()); markers.reports = [];

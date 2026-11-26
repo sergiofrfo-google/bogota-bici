@@ -10,7 +10,7 @@ const ML = process.argv[2];
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
 
 const db = { reports: [], votes: [] };
-let offline = false;
+let offline = false, voteLimit = false, loseAnswer = false;
 const cors = { 'access-control-allow-origin': '*', 'content-type': 'application/json' };
 function rpc(fn, a) {
   if (fn === 'list_reports') return db.reports.map((r) => ({ ...r, device: undefined,
@@ -18,12 +18,15 @@ function rpc(fn, a) {
     fixed: db.votes.filter((v) => v.report_id === r.id && v.vote === 'fixed').length }));
   if (fn === 'add_report') {
     if (a.p_lat < 4.45 || a.p_lat > 4.85) return [400, { message: 'violates check constraint' }];
+    const dup = db.reports.find((r) => r.client_id === a.p_client_id && r.device === a.p_device);
+    if (dup) return dup.id;
     const id = crypto.randomUUID();
-    db.reports.push({ id, type: a.p_type, note: a.p_note, lat: a.p_lat, lng: a.p_lng, created_at: new Date().toISOString(), device: a.p_device });
+    db.reports.push({ id, type: a.p_type, note: a.p_note, lat: a.p_lat, lng: a.p_lng, created_at: new Date().toISOString(), device: a.p_device, client_id: a.p_client_id });
     db.votes.push({ report_id: id, device: a.p_device, vote: 'still' });
     return id;
   }
   if (fn === 'vote_report') {
+    if (voteLimit) return [400, { message: 'rate_limited' }];
     if (!db.votes.some((v) => v.report_id === a.p_report && v.device === a.p_device)) db.votes.push({ report_id: a.p_report, device: a.p_device, vote: a.p_vote });
     return null;
   }
@@ -44,6 +47,7 @@ async function phone(b, name) {
       if (offline) return route.abort('internetdisconnected');
       const fn = u.pathname.split('/').pop();
       const out = rpc(fn, JSON.parse(route.request().postData() || '{}'));
+      if (loseAnswer) return route.abort('connectionreset'); // saved on the server, but the phone never hears back
       if (Array.isArray(out) && out[0] === 400) return route.fulfill({ status: 400, headers: cors, body: JSON.stringify(out[1]) });
       return route.fulfill({ status: out === null ? 204 : 200, headers: cors, body: out === null ? '' : JSON.stringify(out) });
     }
@@ -97,6 +101,30 @@ const check = (ok, msg) => { console.log(ok ? 'PASS' : 'FAIL', msg); if (!ok) fa
 
   await B.evaluate(() => syncReports()); await B.waitForTimeout(600);
   check((await pins(B)) === 2, 'phone B now shows both reports');
+
+  // the server saves the report but the answer is lost: retrying must not make a second copy
+  loseAnswer = true;
+  await A.evaluate(() => map.jumpTo({ center: [-74.06, 4.68], zoom: 16 }));
+  await A.tap('#reportFab'); await A.waitForTimeout(400);
+  await A.tap('[data-act="cat"][data-k="closure"]'); await A.tap('[data-act="publish"]'); await A.waitForTimeout(800);
+  loseAnswer = false;
+  check(db.reports.length === 3, 'lost answer: report was saved once on the server');
+  await A.evaluate(() => syncReports()); await A.waitForTimeout(800);
+  check(db.reports.length === 3 && await A.evaluate(() => S.reports.length === 3), 'retry after a lost answer makes no duplicate');
+
+  // too many votes: the vote is undone on the phone so it can be tried again later
+  voteLimit = true;
+  await B.evaluate(() => syncReports()); await B.waitForTimeout(600);
+  await B.evaluate(() => openReport(S.reports.find((r) => r.type === 'closure'))); await B.waitForTimeout(300);
+  await B.tap('[data-act="vote"][data-v="still"]'); await B.waitForTimeout(600);
+  check(await B.evaluate(() => { const r = S.reports.find((x) => x.type === 'closure'); return r.myVote === null && r.still === 1; }), 'refused vote is undone on the phone');
+  check(/muchas veces/.test(await B.textContent('#toast')), 'rider is told to try later');
+  voteLimit = false;
+
+  // a report older than 60 days that the server still lists (recently confirmed) stays on the map
+  db.reports[0].created_at = new Date(Date.now() - 90 * 864e5).toISOString();
+  await B.evaluate(() => syncReports()); await B.waitForTimeout(600);
+  check((await pins(B)) === 3, 'old but recently confirmed report stays visible');
   await b.close();
   console.log(fails ? `${fails} FAILED` : 'ALL PASSED');
   process.exit(fails ? 1 : 0);

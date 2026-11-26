@@ -167,6 +167,8 @@ const EN = {
   'No se pudo publicar el reporte.': 'The report could not be posted.',
   'Solo se pueden reportar sitios en Bogotá.': 'You can only report places in Bogotá.',
   'pendiente de enviar': 'waiting to send',
+  'Has votado muchas veces seguidas. Intenta más tarde.': 'You have voted many times in a row. Please try again later.',
+  'No se pudo guardar tu voto.': 'Your vote could not be saved.',
   'Reportado {t}': 'Reported {t}',
   '{n} dicen que sigue ahí': '{n} say it is still there',
   '{n} dicen que ya está arreglado': '{n} say it is fixed',

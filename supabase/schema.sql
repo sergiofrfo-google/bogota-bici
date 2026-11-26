@@ -2,6 +2,7 @@
 -- Riders need no account. Each phone keeps a random id (localStorage bb_device) that is only used
 -- to give one vote per phone per report and to rate-limit posting. The app never reads tables directly:
 -- RLS is on with no policies, and all access goes through the three functions below.
+-- Run it on a fresh project: it does not migrate tables made from the old v0.1 draft of this file.
 
 create table if not exists public.reports (
   id         uuid primary key default gen_random_uuid(),
@@ -11,7 +12,8 @@ create table if not exists public.reports (
   lng        double precision not null check (lng between -74.25 and -73.98),
   device     uuid not null,
   created_at timestamptz not null default now(),
-  hidden     boolean not null default false   -- for manual moderation in the dashboard
+  hidden     boolean not null default false,  -- for manual moderation in the dashboard
+  client_id  uuid unique                      -- made on the phone: a retried send can't create a duplicate
 );
 create index if not exists reports_created_idx on public.reports (created_at desc);
 create index if not exists reports_device_idx on public.reports (device, created_at desc);
@@ -51,18 +53,20 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 create or replace function public.add_report(p_type text, p_note text, p_lat double precision,
-                                             p_lng double precision, p_device uuid)
+                                             p_lng double precision, p_device uuid, p_client_id uuid)
 returns uuid
 language plpgsql volatile security definer set search_path = '' as $$
 declare new_id uuid;
 begin
-  if p_device is null then raise exception 'device required'; end if;
+  if p_device is null or p_client_id is null then raise exception 'device and client id required'; end if;
+  select id into new_id from public.reports where client_id = p_client_id and device = p_device;
+  if new_id is not null then return new_id; end if;  -- already received (the first answer got lost)
   if (select count(*) from public.reports where device = p_device and created_at > now() - interval '1 hour') >= 10
      or (select count(*) from public.reports where created_at > now() - interval '1 hour') >= 300 then
     raise exception 'rate_limited' using errcode = 'P0001';
   end if;
-  insert into public.reports (type, note, lat, lng, device)
-  values (p_type, nullif(btrim(left(p_note, 280)), ''), p_lat, p_lng, p_device)
+  insert into public.reports (type, note, lat, lng, device, client_id)
+  values (p_type, nullif(btrim(left(p_note, 280)), ''), p_lat, p_lng, p_device, p_client_id)
   returning id into new_id;
   insert into public.report_votes (report_id, device, vote) values (new_id, p_device, 'still');
   return new_id;
@@ -80,7 +84,7 @@ begin
   on conflict (report_id, device) do nothing;
 end $$;
 
-revoke all on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid),
+revoke all on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid, uuid),
   public.vote_report(uuid, text, uuid) from public;
-grant execute on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid),
+grant execute on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid, uuid),
   public.vote_report(uuid, text, uuid) to anon, authenticated;
