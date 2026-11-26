@@ -1,52 +1,90 @@
--- Bogotá Bici community schema.
--- Run this in a NEW Supabase project (free tier), not inside your existing "mapvivid" project.
+-- Bogotá Bici shared rider reports (Supabase project "bogota-bici", free tier).
+-- Riders need no account. Each phone keeps a random id (localStorage bb_device) that is only used
+-- to give one vote per phone per report and to rate-limit posting. The app never reads tables directly:
+-- RLS is on with no policies, and all access goes through the three functions below.
+-- Run it on a fresh project: it does not migrate tables made from the old v0.1 draft of this file.
 
 create table if not exists public.reports (
-  id          uuid primary key default gen_random_uuid(),
-  type        text not null check (type in
-              ('pothole','closure','missing','danger','theft','repair','air','other')),
-  note        text check (char_length(note) <= 280),
-  lat         double precision not null check (lat between 4.45 and 4.95),
-  lng         double precision not null check (lng between -74.35 and -73.95),
-  user_id     uuid references auth.users(id) on delete set null default auth.uid(),
-  created_at  timestamptz not null default now(),
-  resolved_at timestamptz
+  id         uuid primary key default gen_random_uuid(),
+  type       text not null check (type in ('pothole','closure','missing','danger','theft','other')),
+  note       text check (char_length(note) <= 280),
+  lat        double precision not null check (lat between 4.45 and 4.85),
+  lng        double precision not null check (lng between -74.25 and -73.98),
+  device     uuid not null,
+  created_at timestamptz not null default now(),
+  hidden     boolean not null default false,  -- for manual moderation in the dashboard
+  client_id  uuid unique                      -- made on the phone: a retried send can't create a duplicate
 );
+create index if not exists reports_created_idx on public.reports (created_at desc);
+create index if not exists reports_device_idx on public.reports (device, created_at desc);
 
 create table if not exists public.report_votes (
-  id         uuid primary key default gen_random_uuid(),
   report_id  uuid not null references public.reports(id) on delete cascade,
-  user_id    uuid references auth.users(id) on delete cascade default auth.uid(),
+  device     uuid not null,
   vote       text not null check (vote in ('still','fixed')),
   created_at timestamptz not null default now(),
-  unique (report_id, user_id)
+  primary key (report_id, device)
 );
-
--- Active reports: not resolved, and not older than 60 days without a "still there" vote.
-create or replace view public.reports_active as
-select
-  r.id, r.type, r.note, r.lat, r.lng, r.created_at,
-  count(v.*) filter (where v.vote = 'still') as confirmations,
-  count(v.*) filter (where v.vote = 'fixed') as fixed_votes
-from public.reports r
-left join public.report_votes v on v.report_id = r.id
-where r.resolved_at is null
-group by r.id
-having
-  count(v.*) filter (where v.vote = 'fixed') < 3
-  and (
-    r.created_at > now() - interval '60 days'
-    or max(v.created_at) filter (where v.vote = 'still') > now() - interval '60 days'
-  );
+create index if not exists report_votes_device_idx on public.report_votes (device, created_at desc);
 
 alter table public.reports enable row level security;
 alter table public.report_votes enable row level security;
+revoke all on public.reports, public.report_votes from anon, authenticated;
 
-create policy "anyone can read reports" on public.reports for select using (true);
-create policy "signed-in users can report" on public.reports for insert
-  with check (auth.uid() is not null and user_id = auth.uid());
-create policy "anyone can read votes" on public.report_votes for select using (true);
-create policy "signed-in users can vote" on public.report_votes for insert
-  with check (auth.uid() is not null and user_id = auth.uid());
+-- Active reports: not hidden; posted or confirmed "still there" in the last 60 days;
+-- dropped once at least 3 riders say fixed and they outnumber "still there".
+create or replace function public.list_reports()
+returns table (id uuid, type text, note text, lat double precision, lng double precision,
+               created_at timestamptz, still int, fixed int)
+language sql stable security definer set search_path = '' as $$
+  select r.id, r.type, r.note, r.lat, r.lng, r.created_at,
+         count(*) filter (where v.vote = 'still')::int,
+         count(*) filter (where v.vote = 'fixed')::int
+  from public.reports r
+  left join public.report_votes v on v.report_id = r.id
+  where not r.hidden
+  group by r.id
+  having greatest(r.created_at, coalesce(max(v.created_at) filter (where v.vote = 'still'), r.created_at))
+           > now() - interval '60 days'
+     and not (count(*) filter (where v.vote = 'fixed') >= 3
+              and count(*) filter (where v.vote = 'fixed') > count(*) filter (where v.vote = 'still'))
+  order by r.created_at desc
+  limit 2000;
+$$;
 
-grant select on public.reports_active to anon, authenticated;
+create or replace function public.add_report(p_type text, p_note text, p_lat double precision,
+                                             p_lng double precision, p_device uuid, p_client_id uuid)
+returns uuid
+language plpgsql volatile security definer set search_path = '' as $$
+declare new_id uuid;
+begin
+  if p_device is null or p_client_id is null then raise exception 'device and client id required'; end if;
+  select id into new_id from public.reports where client_id = p_client_id and device = p_device;
+  if new_id is not null then return new_id; end if;  -- already received (the first answer got lost)
+  if (select count(*) from public.reports where device = p_device and created_at > now() - interval '1 hour') >= 10
+     or (select count(*) from public.reports where created_at > now() - interval '1 hour') >= 300 then
+    raise exception 'rate_limited' using errcode = 'P0001';
+  end if;
+  insert into public.reports (type, note, lat, lng, device, client_id)
+  values (p_type, nullif(btrim(left(p_note, 280)), ''), p_lat, p_lng, p_device, p_client_id)
+  returning id into new_id;
+  insert into public.report_votes (report_id, device, vote) values (new_id, p_device, 'still');
+  return new_id;
+end $$;
+
+create or replace function public.vote_report(p_report uuid, p_vote text, p_device uuid)
+returns void
+language plpgsql volatile security definer set search_path = '' as $$
+begin
+  if p_device is null then raise exception 'device required'; end if;
+  if (select count(*) from public.report_votes where device = p_device and created_at > now() - interval '1 hour') >= 60 then
+    raise exception 'rate_limited' using errcode = 'P0001';
+  end if;
+  insert into public.report_votes (report_id, device, vote) values (p_report, p_device, p_vote)
+  on conflict (report_id, device) do nothing;
+end $$;
+
+revoke all on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid, uuid),
+  public.vote_report(uuid, text, uuid) from public;
+grant execute on function public.list_reports(), public.add_report(text, text, double precision, double precision, uuid, uuid),
+  public.vote_report(uuid, text, uuid) to anon, authenticated;

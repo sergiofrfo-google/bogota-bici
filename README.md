@@ -27,11 +27,18 @@ A static site: no build step, no server, no API keys. Open `index.html` through 
 | Official ciclorruta network | IDU via IDECA map server (CC BY 4.0) |
 | Bike shops and pumps | OpenStreetMap via Overpass |
 
-Reports are stored only in the browser (localStorage) for now. `supabase/schema.sql` is the planned shared backend.
+Reports are shared between all riders through a free Supabase project (`bogota-bici`). Riders need no account:
+each phone keeps a random id that allows one vote per report and limits posting (10 reports and 60 votes per hour per phone,
+300 reports per hour in total). The app can only call three database functions (`list_reports`, `add_report`, `vote_report`);
+the tables themselves are closed. `supabase/schema.sql` is the exact setup. A report stays visible for 60 days after it was
+posted or last confirmed "still there", and disappears once at least 3 riders say it is fixed and they outnumber "still there".
+Without signal, reports and votes wait on the phone and are sent on the next sync. To hide an abusive report, set
+`hidden = true` on its row in the Supabase table editor.
 
 Open a route directly with `?a=lat,lng&b=lat,lng&an=Name&bn=Name&m=infra|balanced|fast`, plus `&v=lat,lng;lat,lng&vn=Name` for via points.
 Add `&sim=1` to replay the route instead of using GPS when testing navigation at a desk.
 
+`dev/shared-reports-test.cjs` checks sharing with two simulated phones and a fake server.
 `dev/mobile-audit.cjs` runs a phone-sized Playwright check (sheet drag, route fitting, tramos, navigation, reroute, arrival, via street, places, report, English).
 
 Map data © OpenStreetMap contributors.
