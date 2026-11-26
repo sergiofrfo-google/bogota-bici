@@ -1,9 +1,11 @@
-// Bogotá Bici v0.5: a static app, no build step and no API keys.
+// Bogotá Bici v0.6: a static app, no build step and no API keys.
 // Free services called straight from the browser:
 //   BRouter (routing, OSM way tags, turn hints), Nominatim / Photon (place search and street names),
 //   IDU map server via IDECA (official ciclorruta network), Overpass (bike shops, pumps),
 //   OpenFreeMap (base map, falls back to OSM raster tiles).
 // Community reports are shared between all riders through a free Supabase project (no account needed).
+// The same project receives anonymous usage stats (riders can turn them off) and "this stretch is wrong" flags.
+// sw.js keeps the app and the map areas already seen working with weak or no signal.
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -17,6 +19,7 @@ const LS = {
 };
 const QS = new URLSearchParams(location.search);
 const SIM = QS.has('sim'); // ?sim=1 replays the route instead of using GPS (for testing navigation at a desk)
+const NOSTATS = SIM || QS.has('nostats'); // test runs don't send usage stats
 
 const BOGOTA = [-74.0721, 4.6611];
 const BBOX = { w: -74.25, s: 4.45, e: -73.98, n: 4.85 };
@@ -80,7 +83,7 @@ const S = {
   view: null,                // see VIEWS
   snap: 'peek',              // bottom sheet: 'peek' | 'half' | 'full'
   layers: { idu: true, reports: true },
-  prefs: LS.get('bb_prefs', { pace: 'normal', voice: true }),
+  prefs: { pace: 'normal', voice: true, stats: true, ...LS.get('bb_prefs', {}) },
   saved: LS.get('bb_saved', []),
   reports: loadReports(),
   draftType: 'pothole',
@@ -88,7 +91,7 @@ const S = {
   stepsTab: 'tramos',        // 'tramos' | 'turns'
   sel: null,                 // selected row in the steps view
   fit: null,                 // coordinates the map is fitted to (refit when the sheet moves)
-  names: new Map(),          // stretch name cache
+  names: new Map(LS.get('bb_names', [])), // street name cache (kept between visits, for weak signal)
   errorMsg: '',
 };
 const markers = { A: null, B: null, reports: [], services: [] };
@@ -182,10 +185,30 @@ function classify(tagStr) {
 let routeSeq = 0;
 async function brouter(profile, pts, alt = 0) {
   const ll = pts.map((p) => `${p[0].toFixed(6)},${p[1].toFixed(6)}`).join('|');
-  const res = await fetchT(`https://brouter.de/brouter?lonlats=${ll}&profile=${profile}&alternativeidx=${alt}&format=geojson&timode=2`, {}, 30000);
+  const url = `https://brouter.de/brouter?lonlats=${ll}&profile=${profile}&alternativeidx=${alt}&format=geojson&timode=2`;
+  let res;
+  try { res = await fetchT(url, {}, 30000); } catch (e) {
+    // no signal (or BRouter down): use this exact route from an earlier search, if this phone has it
+    const old = await routeCache('get', url);
+    if (old) { S.fromCache = true; return parseRoute(JSON.parse(old)); }
+    throw Object.assign(new Error(navigator.onLine === false ? L('Sin conexión.') : String(e.message || e)), { offline: true });
+  }
   const text = await res.text();
   if (!res.ok || !text.startsWith('{')) throw new Error(text.slice(0, 200) || `BRouter ${res.status}`);
+  routeCache('put', url, text);
   return parseRoute(JSON.parse(text));
+}
+// the last ~30 routes found, kept on the phone (Cache API) so saved and recent routes open without signal
+async function routeCache(op, url, text) {
+  try {
+    if (!window.caches) return null;
+    const c = await caches.open('bb-routes');
+    if (op === 'get') { const r = await c.match(url); return r ? await r.text() : null; }
+    await c.put(url, new Response(text, { headers: { 'content-type': 'application/json' } }));
+    const keys = await c.keys();
+    for (const k of keys.slice(0, Math.max(0, keys.length - 30))) await c.delete(k);
+  } catch { /* storage full or not allowed: just don't cache */ }
+  return null;
 }
 function parseRoute(gj) {
   const f = gj.features[0];
@@ -240,19 +263,26 @@ async function computeRoutes() {
   S.routes = { infra: null, balanced: null, fast: null };
   S.alt = { infra: 0, balanced: 0, fast: 0 };
   S.sel = null;
+  S.fromCache = false;
   drawRoutes();
   show('loading');
   const res = await Promise.allSettled(MODE_KEYS.map((k) => brouter(MODES[k].profile, wp())));
   res.forEach((r, i) => { if (r.status === 'fulfilled') S.routes[MODE_KEYS[i]] = r.value; });
   if (!MODE_KEYS.some((k) => S.routes[k])) {
     console.error(res);
-    S.errorMsg = String(res[0].reason?.message || res[0].reason || 'Error');
+    const offline = res.some((r) => r.reason?.offline);
+    S.errorMsg = offline ? L('Sin conexión. Las rutas que ya buscaste en este teléfono se abren sin señal; esta todavía no.') : String(res[0].reason?.message || res[0].reason || 'Error');
+    track('route_fail', { offline });
     show('error');
     return;
   }
   if (!cur()) S.mode = MODE_KEYS.find((k) => S.routes[k]);
   show('route');
   drawRoutes(true);
+  if (S.fromCache) toast(L('Sin conexión: mostrando la ruta guardada en este teléfono.'), 4500);
+  const r0 = S.routes.infra || cur();
+  track('route_search', { km: +(r0.length / 1000).toFixed(1), via: S.via ? (S.via.street ? 'street' : 'point') : null, routes: MODE_KEYS.filter((k) => S.routes[k]).length, cached: S.fromCache });
+  checkIdu(); // in the background: stretches "with cars" where the city's map has a ciclorruta
 }
 async function nextAlternative() {
   const k = S.mode;
@@ -264,6 +294,7 @@ async function nextAlternative() {
     S.alt[k] = idx; S.routes[k] = r; S.sel = null;
     show('route'); drawRoutes(true);
     if (same) toast(L('Esta alternativa es casi igual a la anterior.'));
+    checkIdu();
   } catch { toast(L('No hay más alternativas para esta ruta.')); }
 }
 
@@ -545,6 +576,7 @@ async function setVia(p) {
   $('via').value = p.name;
   S.viaPending = false;
   if (!S.A || !S.B) { toast(L('Elige primero el origen y el destino.')); return; }
+  track('via_add', { kind: p.isStreet ? 'street' : 'place' });
   let pts = null;
   if (p.isStreet) {
     toast(L('Buscando {name}…', { name: p.name }), 2500);
@@ -561,6 +593,7 @@ async function setVia(p) {
 function setViaPoint(lngLat) {
   S.via = { label: L('Punto en el mapa'), street: false, pts: [[lngLat.lng, lngLat.lat]] };
   S.viaPending = false;
+  track('via_add', { kind: 'point' });
   $('viaRow').hidden = false; $('via').value = S.via.label;
   const v = S.via;
   reverseName(lngLat).then((n) => { if (n && S.via === v) { v.label = n; $('via').value = n; if (S.view === 'route') rerender(); } });
@@ -759,6 +792,7 @@ const VIEWS = {
       ${blurb ? `<span class="sub">${blurb}${S.alt[S.mode] ? ` · ${L('alternativa {n}', { n: S.alt[S.mode] + 1 })}` : ''}</span>` : ''}
       <div class="legend">${ORDER.map((k) => `<div><span class="sw ${k}"></span><span>${TYPES[k].short}</span><b>${r.pct[k]} %</b></div>`).join('')}</div>
       ${worst && worst.s.d >= 400 ? `<button class="alert" data-act="selTramo" data-i="${worst.i}">${ICONS.warn}<span style="flex:1"><strong>${L('Tramo con carros más largo: {d}', { d: fmtM(worst.s.d) })}</strong><span>${L('En el km {km}. Toca para verlo en el mapa.', { km: kmAt(r.cum[worst.s.i0]) })}</span></span></button>` : ''}
+      ${(() => { const m = ts.map((s, i) => ({ s, i })).filter((x) => x.s.idu); return m.length ? `<button class="alert idu" data-act="selTramo" data-i="${m[0].i}">${ICONS.flag}<span style="flex:1"><strong>${L(m.length === 1 ? 'Un tramo “con carros” tiene ciclorruta según la ciudad' : '{n} tramos “con carros” tienen ciclorruta según la ciudad', { n: m.length })}</strong><span>${L('Toca para verlo y decirnos cuál es correcto.')}</span></span></button>` : ''; })()}
       ${near.length
         ? `<button class="alert" data-act="openReport" data-id="${near[0].id}">${ICONS.warn}<span style="flex:1"><strong>${L(near.length === 1 ? '{n} reporte activo en esta ruta' : '{n} reportes activos en esta ruta', { n: near.length })}</strong><span>${esc(near.map((x) => REPORT_TYPES[x.type].label).join(' · '))}</span></span></button>`
         : `<div class="okline">${ICONS.check} ${L('Sin reportes activos en esta ruta')}</div>`}
@@ -781,14 +815,17 @@ const VIEWS = {
       const ts = tramosOf(r);
       const selCard = S.sel != null && ts[S.sel] ? (() => {
         const s = ts[S.sel];
-        return `<div class="selcard" data-peek><div class="rail ${s.t}"></div><div class="body"><div class="top"><span class="nm" data-k="${esc(key(s))}">${esc(tramoLabel(s))}</span><span>${fmtM(s.d)}</span></div><span class="small">${L('Tramo {i} de {n}', { i: S.sel + 1, n: ts.length })} · km ${kmAt(r.cum[s.i0])} · ${TYPES[s.t].label}</span></div>
-          <div class="stepper"><button class="mini" data-act="selTramo" data-i="${S.sel - 1}" ${S.sel === 0 ? 'disabled' : ''} aria-label="${L('Tramo anterior')}">${ICONS.back}</button><button class="mini" data-act="selTramo" data-i="${S.sel + 1}" ${S.sel === ts.length - 1 ? 'disabled' : ''} aria-label="${L('Tramo siguiente')}" style="transform:scaleX(-1)">${ICONS.back}</button></div></div>`;
+        return `<div class="selcard"><div class="rail ${s.t}"></div><div class="body"><div class="top"><span class="nm" data-k="${esc(key(s))}">${esc(tramoLabel(s))}</span><span>${fmtM(s.d)}</span></div><span class="small">${L('Tramo {i} de {n}', { i: S.sel + 1, n: ts.length })} · km ${kmAt(r.cum[s.i0])} · ${TYPES[s.t].label}</span></div>
+          <div class="stepper"><button class="mini" data-act="selTramo" data-i="${S.sel - 1}" ${S.sel === 0 ? 'disabled' : ''} aria-label="${L('Tramo anterior')}">${ICONS.back}</button><button class="mini" data-act="selTramo" data-i="${S.sel + 1}" ${S.sel === ts.length - 1 ? 'disabled' : ''} aria-label="${L('Tramo siguiente')}" style="transform:scaleX(-1)">${ICONS.back}</button></div></div>
+          ${s.idu ? `<div class="idunote">${ICONS.flag}<span>${L('La ciudad (IDU) tiene una ciclorruta aquí, pero OpenStreetMap dice “con carros”. ¿Cuál es correcto?')}</span></div>` : ''}
+          <button class="linkbtn" data-peek data-act="flag">${S.flagged?.has(key(s)) ? L('Gracias, ya nos avisaste de este tramo') : L('¿Este tramo está mal marcado? Avísanos')}</button>`;
       })() : '';
       const items = ts.map((s, i) => {
         const reps = near.filter((x) => distToLine([x.lng, x.lat], s.coords) < 35);
         return `<li><button class="steprow${S.sel === i ? ' on' : ''}" data-act="selTramo" data-i="${i}"><div class="rail ${s.t}"></div><div class="body">
           <div class="top"><span class="nm" data-k="${esc(key(s))}">${esc(tramoLabel(s))}</span><span>${fmtM(s.d)}</span></div>
           <span class="small">km ${kmAt(r.cum[s.i0])} · ${TYPES[s.t].label}</span>
+          ${s.idu ? `<span class="rep idutag">${L('Ciclorruta según la ciudad')}</span>` : ''}
           ${reps.map((x) => `<span class="rep">⚠ ${esc(REPORT_TYPES[x.type].label)}</span>`).join('')}
         </div></button></li>`;
       }).join('');
@@ -837,6 +874,17 @@ const VIEWS = {
       ${r.myVote ? `<span class="small">${L(r.myVote === 'still' ? 'Ya votaste: sigue ahí. ¡Gracias!' : 'Ya votaste: arreglado. ¡Gracias!')}</span>` : ''}
     </div>`;
   },
+  flag: () => {
+    const s = tramosOf(cur())[S.sel];
+    const opts = [...ORDER.map((k) => [k, TYPES[k].label]), ['none', L('No se puede pasar en bici')]];
+    return `<div class="stack">
+      <div class="head" data-peek><button class="back" data-act="flagBack" aria-label="${L('Volver')}">${ICONS.back}</button><div style="min-width:0"><h2>${L('¿Cómo es este tramo en realidad?')}</h2><span class="sub">${esc(tramoLabel(s))} · ${fmtM(s.d)} · ${L('la app dice: {t}', { t: lc(TYPES[s.t].label) })}</span></div></div>
+      <div class="cats">${opts.filter(([k]) => k !== s.t).map(([k, l]) => `<button data-act="flagType" data-k="${k}" aria-pressed="${S.flagType === k}">${k === 'none' ? ICONS.close : `<span class="sw ${k}" style="width:22px;height:6px;border-radius:3px"></span>`}${l}</button>`).join('')}</div>
+      <div><label class="lbl" for="flagNote">${L('Detalle (opcional)')}</label><textarea id="flagNote" rows="2" maxlength="280" placeholder="${L('Ej.: hay ciclorruta en el separador desde la calle 100')}"></textarea></div>
+      <button class="btn primary" data-act="flagSend" ${S.flagType ? '' : 'disabled'}>${L('Enviar')}</button>
+      <span class="small" style="text-align:center">${L('Revisamos estos avisos y corregimos OpenStreetMap, que es de donde salen los tipos de vía.')}</span>
+    </div>`;
+  },
   layers: () => `<div class="stack">
       <div class="head" data-peek><button class="back" data-act="close" aria-label="${L('Cerrar')}">${ICONS.close}</button><h2>${L('Capas y opciones')}</h2></div>
       <div><label class="lbl">${L('Idioma')} / Language</label>
@@ -847,7 +895,9 @@ const VIEWS = {
         <label class="toggle"><input type="checkbox" data-pref="voice" ${S.prefs.voice ? 'checked' : ''}><span>${L('Voz durante la navegación')}<small>${L('Anuncia giros y tramos con carros.')}</small></span></label>
         <label class="toggle"><input type="checkbox" data-layer="idu" ${S.layers.idu ? 'checked' : ''}><span class="sw" style="background:var(--idu)"></span><span>${L('Red oficial de ciclorrutas (IDU)')}<small>${L('Datos IDU / IDECA, CC BY 4.0. Acércate para verla.')}</small></span></label>
         <label class="toggle"><input type="checkbox" data-layer="reports" ${S.layers.reports ? 'checked' : ''}><span class="sw" style="background:var(--warn)"></span><span>${L('Reportes')}</span></label>
+        <label class="toggle"><input type="checkbox" data-pref="stats" ${S.prefs.stats !== false ? 'checked' : ''}><span>${L('Compartir estadísticas anónimas de uso')}<small>${L('Nos ayuda a mejorar la app y, más adelante, a mostrar las rutas más usadas. No guarda tu nombre ni el inicio y el final de tus recorridos.')}</small></span></label>
       </div>
+      ${installBox()}
       <div class="legend">${ORDER.map((k) => `<div><span class="sw ${k}"></span><span>${TYPES[k].label}</span></div>`).join('')}</div>
       <span class="small">${L('Rutas: “Más ciclorruta” usa el perfil safety de BRouter, “Equilibrada” el perfil trekking y “Más rápida” el perfil fastbike.')}</span>
     </div>`,
@@ -948,6 +998,20 @@ function timeAgo(ts) {
   return d === 1 ? L('hace 1 día') : L('hace {n} días', { n: d });
 }
 
+// a rider says a stretch's path type is wrong: goes to the stretch_flags table for review
+function sendFlag() {
+  const s = tramosOf(cur())[S.sel];
+  if (!s || !S.flagType) return;
+  const mid = pointAlong(s.coords, 0.5);
+  const args = { p_device: DEVICE, p_client_id: uuid(), p_lat: +mid[1].toFixed(6), p_lng: +mid[0].toFixed(6), p_osm_type: s.t, p_real_type: S.flagType,
+    p_idu: !!s.idu, p_length: Math.round(s.d), p_name: S.names.get(key(s)) || null, p_note: ($('flagNote')?.value || '').trim().slice(0, 280) || null };
+  (S.flagged ||= new Set()).add(key(s));
+  track('flag_stretch', { osm: s.t, real: S.flagType, idu: !!s.idu });
+  sbCall('flag_stretch', args).catch((e) => { if (!e.status || e.status >= 500) queue({ kind: 'flag', args }); });
+  toast(L('¡Gracias! Revisaremos este tramo.'));
+  selectTramo(S.sel);
+}
+
 // ---------------------------------------------------------------- saved routes and sharing
 const isSaved = () => S.A && S.B && S.saved.some((s) => dist([s.A.lng, s.A.lat], [S.A.lng, S.A.lat]) < 30 && dist([s.B.lng, s.B.lat], [S.B.lng, S.B.lat]) < 30 && (s.via?.label || '') === (S.via?.label || ''));
 function saveRoute() {
@@ -981,8 +1045,8 @@ function wireSheet() {
     const b = e.target.closest('[data-act]');
     if (!b || b.disabled) return;
     const act = b.dataset.act;
-    if (act === 'mode') { S.mode = b.dataset.mode; S.sel = null; rerender(); drawRoutes(true); }
-    else if (act === 'steps') { S.sel = null; show('steps'); highlight(null); }
+    if (act === 'mode') { track('mode_pick', { mode: b.dataset.mode }); S.mode = b.dataset.mode; S.sel = null; rerender(); drawRoutes(true); }
+    else if (act === 'steps') { track('tramos_open', { mode: S.mode }); S.sel = null; show('steps'); highlight(null); }
     else if (act === 'tab') { S.stepsTab = b.dataset.tab; S.sel = null; highlight(null); rerender(); if (S.snap === 'peek') setSnap('half'); loadNames(); }
     else if (act === 'selTramo') selectTramo(+b.dataset.i);
     else if (act === 'selTurn') selectTurn(+b.dataset.i);
@@ -993,12 +1057,13 @@ function wireSheet() {
     else if (act === 'altRoute') nextAlternative();
     else if (act === 'addVia') startVia();
     else if (act === 'clearVia') clearVia();
-    else if (act === 'save') saveRoute();
-    else if (act === 'share') share();
+    else if (act === 'save') { if (!isSaved()) track('save_route'); saveRoute(); }
+    else if (act === 'share') { track('share_route'); share(); }
     else if (act === 'openSaved') { const s = S.saved[+b.dataset.i]; S.mode = s.mode || 'infra'; openRoute(s.A, s.B, s.via); }
     else if (act === 'delSaved') { S.saved.splice(+b.dataset.i, 1); LS.set('bb_saved', S.saved); show(S.saved.length ? 'home' : null); }
     else if (act === 'close') show(cur() ? 'route' : S.saved.length && !S.A ? 'home' : null);
-    else if (act === 'lang') { setLang(b.dataset.k); }
+    else if (act === 'lang') { setLang(b.dataset.k); track('lang', { lang: b.dataset.k }); }
+    else if (act === 'install') install();
     else if (act === 'pace') { S.prefs.pace = b.dataset.k; LS.set('bb_prefs', S.prefs); rerender(); }
     else if (act === 'cat') { S.draftType = b.dataset.k; $('sheetBody').querySelectorAll('[data-act="cat"]').forEach((x) => x.setAttribute('aria-pressed', x === b)); }
     else if (act === 'cancelReport') show(cur() ? 'route' : null);
@@ -1006,6 +1071,10 @@ function wireSheet() {
     else if (act === 'publish') publishReport();
     else if (act === 'openReport') openReport(S.reports.find((r) => r.id === b.dataset.id));
     else if (act === 'vote') vote(b.dataset.v);
+    else if (act === 'flag') { if (!S.flagged?.has(key(tramosOf(cur())[S.sel]))) { S.flagType = null; show('flag', 'half'); } }
+    else if (act === 'flagBack') selectTramo(S.sel);
+    else if (act === 'flagType') { S.flagType = b.dataset.k; $('sheetBody').querySelectorAll('[data-act="flagType"]').forEach((x) => x.setAttribute('aria-pressed', x === b)); $('sheetBody').querySelector('[data-act="flagSend"]').disabled = false; }
+    else if (act === 'flagSend') sendFlag();
     else if (act === 'openPlace') openPlace(svcVisible()[+b.dataset.i]);
     else if (act === 'backServices') { show('services'); drawServices(true); }
     else if (act === 'svcFilter') { SV.filter = b.dataset.k; rerender(); drawServices(true); }
@@ -1023,7 +1092,12 @@ function wireSheet() {
   });
   $('sheetBody').addEventListener('change', (e) => {
     const l = e.target.dataset.layer, p = e.target.dataset.pref;
-    if (p) { S.prefs[p] = e.target.checked; LS.set('bb_prefs', S.prefs); return; }
+    if (p) {
+      if (p === 'stats' && !e.target.checked) { track('stats_off'); flushEvents(); }
+      S.prefs[p] = e.target.checked; LS.set('bb_prefs', S.prefs);
+      if (p === 'stats' && !e.target.checked) { EV.q = EV.q.filter((x) => x.n === 'stats_off'); LS.set('bb_events', EV.q); }
+      return;
+    }
     if (!l) return;
     S.layers[l] = e.target.checked;
     applyLayers();
@@ -1053,10 +1127,10 @@ const DEVICE = (() => {
 })();
 // cid: made on the phone, so sending the same report twice (lost answer, retry) never creates a duplicate
 const addArgs = (r) => ({ p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE, p_client_id: r.cid || (r.cid = uuid()) });
-async function sbCall(fn, body) {
+async function sbCall(fn, body, keepalive) {
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 12000);
   try {
-    const res = await fetch(SB.url + fn, { method: 'POST', signal: ctl.signal, headers: { apikey: SB.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const res = await fetch(SB.url + fn, { method: 'POST', keepalive: !!keepalive, signal: ctl.signal, headers: { apikey: SB.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
     const txt = await res.text();
     const data = txt ? JSON.parse(txt) : null;
     if (!res.ok) { const e = new Error(data?.message || res.status); e.status = res.status; throw e; }
@@ -1092,6 +1166,10 @@ async function syncReports() {
           const r = o.report;
           const id = await sbCall('add_report', addArgs(r));
           remember(id, 'still');
+        } else if (o.kind === 'flag') {
+          await sbCall('flag_stretch', o.args);
+        } else if (o.kind === 'ride') {
+          if (S.prefs.stats !== false) await sbCall('log_ride', o.args);
         } else if (!String(o.id).startsWith('r')) {
           await sbCall('vote_report', { p_report: o.id, p_vote: o.vote, p_device: DEVICE });
         }
@@ -1147,6 +1225,7 @@ async function publishReport() {
   const r = { id: 'r' + Date.now(), cid: uuid(), type: S.draftType, note: ($('note')?.value || '').trim().slice(0, 280), lng: c.lng, lat: c.lat, created: Date.now(), still: 1, fixed: 0, myVote: 'still' };
   if (r.lat < BBOX.s || r.lat > BBOX.n || r.lng < BBOX.w || r.lng > BBOX.e) { toast(L('Solo se pueden reportar sitios en Bogotá.')); return; }
   S.reports.push(r); drawReports();
+  track('report_add', { type: r.type, note: !!r.note });
   show(cur() ? 'route' : null);
   try {
     const id = await sbCall('add_report', addArgs(r));
@@ -1160,17 +1239,18 @@ async function publishReport() {
   }
 }
 function openReport(r) { if (!r) return; S.current = r; show('reportView'); S.fit = null; map.easeTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 15) }); }
-function vote(v) {
-  const r = S.current;
-  if (r.myVote) return;
-  r[v] += 1; r.myVote = v; remember(r.id, v); saveReports(); drawReports(); rerender();
+function vote(v) { voteOn(S.current, v, 'sheet'); }
+function voteOn(r, v, from) {
+  if (!r || r.myVote) return;
+  track('report_vote', { vote: v, type: r.type, from });
+  r[v] += 1; r.myVote = v; remember(r.id, v); saveReports(); drawReports(); if (S.view && !N.on) rerender();
   if (r.pending) return; // its "still there" goes with the report itself
   sbCall('vote_report', { p_report: r.id, p_vote: v, p_device: DEVICE })
     .catch((e) => {
       if (!e.status || e.status >= 500) { queue({ kind: 'vote', id: r.id, vote: v }); return; }
       // refused (e.g. too many votes this hour): undo it so the rider can vote again later
       r[v] -= 1; r.myVote = null; const m = LS.get('bb_votes', {}); delete m[r.id]; LS.set('bb_votes', m);
-      saveReports(); drawReports(); rerender();
+      saveReports(); drawReports(); if (S.view && !N.on) rerender();
       toast(L(/rate_limited/.test(e.message) ? 'Has votado muchas veces seguidas. Intenta más tarde.' : 'No se pudo guardar tu voto.'));
     });
 }
@@ -1183,6 +1263,62 @@ function drawReports() {
     el.addEventListener('click', (e) => { e.stopPropagation(); if (!N.on) openReport(r); });
     markers.reports.push(new maplibregl.Marker({ element: el }).setLngLat([r.lng, r.lat]).addTo(map));
   }
+}
+
+// ---------------------------------------------------------------- anonymous usage stats
+// Small events ("searched a route", "started navigation", "answered a report pop-up") go to Supabase in
+// batches, with the phone's random id and no names or places. Riders can turn this off in Capas y opciones.
+// With signal they go out every ~20 s; without signal they wait on the phone (at most 300).
+const EV = { q: LS.get('bb_events', []), timer: null, busy: false };
+function track(n, p) {
+  if (S.prefs.stats === false && n !== 'stats_off') return;
+  EV.q.push({ n, p: p || {}, t: Date.now() });
+  if (EV.q.length > 300) EV.q = EV.q.slice(-300);
+  LS.set('bb_events', EV.q);
+  clearTimeout(EV.timer); EV.timer = setTimeout(flushEvents, 20000);
+}
+async function flushEvents() {
+  clearTimeout(EV.timer); EV.timer = null;
+  if (EV.busy || !EV.q.length || NOSTATS) return;
+  EV.busy = true;
+  const batch = EV.q.slice(0, 50);
+  try {
+    await sbCall('log_events', { p_device: DEVICE, p_events: batch }, true);
+    EV.q = EV.q.slice(batch.length);
+  } catch (e) {
+    if (e.status && e.status < 500 && !/rate_limited/.test(e.message)) EV.q = EV.q.slice(batch.length); // refused: drop, don't retry forever
+  } finally {
+    LS.set('bb_events', EV.q); EV.busy = false;
+  }
+  if (EV.q.length && !EV.timer) EV.timer = setTimeout(flushEvents, 5000);
+}
+// The part of the route the rider actually followed, without everything within 400 m (straight line) of where
+// the ride started and ended, so home and work are never stored; simplified to a point every ~15 m.
+// Used later to show popular routes.
+const RIDE_TRIM = 400;
+function rideGeom(lines) {
+  const all = [];
+  for (const l of lines) for (const p of l) if (!all.length || dist(all[all.length - 1], p) > 0.5) all.push(p);
+  if (all.length < 2) return null;
+  const a = all[0], b = all[all.length - 1];
+  const far = (p) => dist(p, a) >= RIDE_TRIM && dist(p, b) >= RIDE_TRIM;
+  let i0 = all.findIndex(far), i1 = all.length - 1;
+  while (i1 >= 0 && !far(all[i1])) i1--;
+  if (i0 < 0 || i1 - i0 < 1) return null;
+  const cut = all.slice(i0, i1 + 1);
+  const km = lineLength(cut) / 1000;
+  if (km < 0.5) return null;
+  const out = [cut[0]];
+  for (const p of cut.slice(1)) if (dist(out[out.length - 1], p) >= 15) out.push(p);
+  if (out[out.length - 1] !== cut[cut.length - 1]) out.push(cut[cut.length - 1]);
+  return { km, geom: out.slice(0, 3000).map((p) => [+p[0].toFixed(4), +p[1].toFixed(4)]) };
+}
+function logRide(lines, mode, noCars) {
+  if (S.prefs.stats === false || NOSTATS) return;
+  const g = rideGeom(lines);
+  if (!g) return;
+  const args = { p_device: DEVICE, p_client_id: uuid(), p_mode: mode, p_km: +g.km.toFixed(2), p_no_cars: noCars, p_geom: g.geom };
+  sbCall('log_ride', args).catch((e) => { if (!e.status || e.status >= 500) queue({ kind: 'ride', args }); });
 }
 
 // ---------------------------------------------------------------- navigation (follow the route with GPS)
@@ -1210,8 +1346,10 @@ function startNav() {
   const r = cur();
   if (!r) return;
   if (!SIM && !navigator.geolocation) { toast(L('Tu navegador no permite ubicación.')); return; }
-  Object.assign(N, { on: true, route: r, follow: true, idx: 0, progress: 0, offCount: 0, said: {}, first: true, man: null });
+  Object.assign(N, { on: true, route: r, follow: true, idx: 0, progress: 0, offCount: 0, said: {}, first: true, man: null, ridden: [], reroutes: 0, t0: Date.now(), asked: {}, ask: null, mode: S.mode, noCars: r.noCars });
   N.viaAt = (S.via?.pts || []).map((p) => ({ p, at: snapTo(r, p, 0).along }));
+  N.reps = repsAlong(r);
+  track('nav_start', { mode: S.mode, km: +(r.length / 1000).toFixed(1), no_cars: r.noCars, via: !!S.via, voice: !!S.prefs.voice });
   document.body.classList.add('navigating');
   $('nav').hidden = false;
   $('sheet').hidden = true; $('placePin').hidden = true;
@@ -1238,6 +1376,12 @@ function startNav() {
 function stopNav(arrived) {
   if (!N.on) return;
   N.on = false;
+  N.ridden.push(sliceByDist(N.route, 0, N.progress));
+  const km = N.ridden.reduce((a, l) => a + lineLength(l), 0) / 1000;
+  track('nav_end', { arrived: !!arrived, mode: N.mode, km: +km.toFixed(1), min: Math.round((Date.now() - N.t0) / 60000), reroutes: N.reroutes });
+  logRide(N.ridden, N.mode, N.noCars);
+  if (N.ask && !N.ask.answered) track('report_popup', { answer: 'ignored', type: N.ask.x.r.type });
+  N.ask = null; $('navAlert').hidden = true;
   if (N.watch != null) navigator.geolocation.clearWatch(N.watch);
   clearInterval(N.sim); N.watch = null; N.sim = null;
   try { N.wake?.release(); } catch { /* ignore */ }
@@ -1297,8 +1441,10 @@ async function reroute(pt) {
     const ahead = (N.viaAt || []).filter((v) => v.at > N.progress + 30).map((v) => v.p);
     const r = await brouter(MODES[S.mode].profile, [pt, ...ahead, [S.B.lng, S.B.lat]]);
     if (!N.on) return;
+    N.ridden.push(sliceByDist(N.route, 0, N.progress)); N.reroutes++;
     Object.assign(N, { route: r, idx: 0, progress: 0, said: {}, man: null });
     N.viaAt = ahead.map((p) => ({ p, at: snapTo(r, p, 0).along }));
+    N.reps = repsAlong(r);
     map.getSource('route').setData(routeFC(r));
     renderNav();
   } catch { toast(L('No pude recalcular. Sigue hacia el destino.')); }
@@ -1346,6 +1492,56 @@ function renderNav() {
     N.said[r.id + 'ca' + change.i0] = 1;
     if (!(dTo < 170 && Math.abs(dTo - dChange) < 60)) speak(L('Atención: en {n} metros, tramo con carros.', { n: Math.round(dChange / 10) * 10 }));
   }
+  navReports(prog);
+}
+// Reports on the route, shown as a small silent line under the directions (no voice, no vibration):
+// "Hueco en 180 m" while you approach, then for 15 s after you pass it "¿Sigue ahí?" with two buttons.
+// Ignoring it is fine; it disappears by itself.
+function repsAlong(r) {
+  return activeReports().filter((x) => distToLine([x.lng, x.lat], r.coords) < 35)
+    .map((x) => ({ r: x, at: snapTo(r, [x.lng, x.lat], 0).along })).sort((a, b) => a.at - b.at);
+}
+function navReports(prog) {
+  const el = $('navAlert'), now = Date.now();
+  if (el.dataset.k === 'thanks') return;
+  el.style.top = Math.round($('navTop').getBoundingClientRect().bottom + 8) + 'px';
+  if (N.ask && (now > N.ask.until || N.ask.answered)) {
+    if (!N.ask.answered) track('report_popup', { answer: 'ignored', type: N.ask.x.r.type });
+    N.ask = null;
+  }
+  if (!N.ask) {
+    const passed = (N.reps || []).find((x) => prog - x.at >= 15 && prog - x.at < 150 && !N.asked[x.r.id]);
+    if (passed) {
+      N.asked[passed.r.id] = 1;
+      if (!passed.r.myVote && !passed.r.pending) N.ask = { x: passed, until: now + 15000 };
+    }
+  }
+  if (N.ask) {
+    const r = N.ask.x.r;
+    const html = `<span class="ic">${REPORT_TYPES[r.type].icon}</span><span class="tx">${esc(L('{t}: ¿sigue ahí?', { t: REPORT_TYPES[r.type].label }))}</span><button type="button" data-a="still">${L('Sí')}</button><button type="button" data-a="fixed">${L('Ya no')}</button>`;
+    if (el.dataset.k !== 'ask' + r.id) { el.innerHTML = html; el.dataset.k = 'ask' + r.id; }
+    el.className = 'navalert ask'; el.hidden = false;
+    return;
+  }
+  const next = (N.reps || []).find((x) => x.at - prog > -10 && x.at - prog < 250);
+  if (next) {
+    const d = Math.max(0, next.at - prog);
+    el.innerHTML = `<span class="ic">${REPORT_TYPES[next.r.type].icon}</span><span class="tx">${esc(d < 20 ? L('{t} aquí', { t: REPORT_TYPES[next.r.type].label }) : L('{t} en {d}', { t: REPORT_TYPES[next.r.type].label, d: fmtM(d) }))}</span>`;
+    el.dataset.k = 'near'; el.className = 'navalert'; el.hidden = false;
+    return;
+  }
+  el.hidden = true; el.dataset.k = '';
+}
+function answerAsk(a) {
+  if (!N.ask) return;
+  const r = N.ask.x.r;
+  N.ask.answered = true;
+  track('report_popup', { answer: a, type: r.type });
+  voteOn(r, a, 'nav');
+  const el = $('navAlert');
+  el.innerHTML = `<span class="ic">${ICONS.check}</span><span class="tx">${esc(L('¡Gracias!'))}</span>`;
+  el.dataset.k = 'thanks'; el.className = 'navalert';
+  setTimeout(() => { if (N.on && el.dataset.k === 'thanks') { el.hidden = true; el.dataset.k = ''; N.ask = null; } }, 1800);
 }
 function startSim() {
   let d = 0;
@@ -1373,23 +1569,35 @@ function wireNav() {
     if (N.lastPos) map.easeTo({ center: N.marker.getLngLat(), zoom: 17, pitch: 45, bearing: N.marker.getRotation(), padding: navPadding(), duration: 600 });
   });
   $('navReport').addEventListener('click', () => { stopNav(); startReport(); });
+  $('navAlert').addEventListener('click', (e) => { const b = e.target.closest('button[data-a]'); if (b) answerAsk(b.dataset.a); });
 }
 
 // ---------------------------------------------------------------- IDU overlay (loaded per view from the city map server)
 const IDU_URL = 'https://serviciosgis.catastrobogota.gov.co/arcgis/rest/services/Mapa_Referencia/Mapa_Referencia/MapServer/18/query';
 const SURFACE = { 0: 'Sin dato', 1: 'Concreto', 2: 'Asfalto', 3: 'Mixtos', 4: 'Adoquín concreto', 5: 'Adoquín arcilla' }; // translated when shown
 const iduFeatures = new Map();
-const iduDone = new Set();
+const IDU_STEP = 0.05;
+const iduLoading = new Map(); // tile -> promise, so the map and the route check never fetch the same tile twice
 async function loadIdu() {
   if (!S.layers.idu || map.getZoom() < 12.5) return;
   // load in 0.05° tiles so panning back and forth doesn't repeat requests
-  const b = map.getBounds(), step = 0.05;
+  const b = map.getBounds();
+  await loadIduBox(b.getWest(), b.getSouth(), b.getEast(), b.getNorth(), 12);
+  map.getSource('idu')?.setData({ type: 'FeatureCollection', features: [...iduFeatures.values()] });
+}
+async function loadIduBox(w, s, e, n, max = 40) {
   const tiles = [];
-  for (let x = Math.floor(b.getWest() / step); x <= Math.floor(b.getEast() / step); x++)
-    for (let y = Math.floor(b.getSouth() / step); y <= Math.floor(b.getNorth() / step); y++)
-      if (!iduDone.has(x + ',' + y)) tiles.push([x, y]);
-  for (const [x, y] of tiles.slice(0, 12)) {
-    iduDone.add(x + ',' + y);
+  for (let x = Math.floor(w / IDU_STEP); x <= Math.floor(e / IDU_STEP); x++)
+    for (let y = Math.floor(s / IDU_STEP); y <= Math.floor(n / IDU_STEP); y++) tiles.push([x, y]);
+  await Promise.all(tiles.slice(0, max).map(([x, y]) => {
+    const k = x + ',' + y;
+    if (!iduLoading.has(k)) iduLoading.set(k, loadIduTile(x, y).catch(() => iduLoading.delete(k)));
+    return iduLoading.get(k);
+  }));
+}
+async function loadIduTile(x, y) {
+  const step = IDU_STEP;
+  {
     try {
       for (let offset = 0; offset < 4000; offset += 1000) {
         const q = new URLSearchParams({
@@ -1401,9 +1609,67 @@ async function loadIdu() {
         for (const f of j.features || []) if (f.geometry) iduFeatures.set(f.id ?? f.properties.OBJECTID, { type: 'Feature', properties: { s: SURFACE[f.properties.CICTSUPERF] ?? 'Sin dato' }, geometry: f.geometry });
         if (!j.properties?.exceededTransferLimit && !j.exceededTransferLimit) break;
       }
-    } catch (e) { iduDone.delete(x + ',' + y); console.warn('IDU', e); }
+    } catch (e) { console.warn('IDU', e); throw e; }
   }
-  map.getSource('idu')?.setData({ type: 'FeatureCollection', features: [...iduFeatures.values()] });
+}
+
+// ---------------------------------------------------------------- city map vs OpenStreetMap
+// A stretch OSM tags as "with cars" but where the city's ciclorruta layer (IDU) runs alongside is
+// probably mislabelled in OSM (or the city layer is out of date). Mark it so riders can say which is right.
+function iduIndex() {
+  // bounding boxes of the city polygons in local metres, rebuilt only when new tiles arrived
+  if (iduIndex.n === iduFeatures.size) return iduIndex.list;
+  const list = [];
+  for (const f of iduFeatures.values()) {
+    const polys = f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.type === 'MultiPolygon' ? f.geometry.coordinates : [];
+    for (const poly of polys) {
+      let w = 180, s = 90, e = -180, n = -90;
+      for (const [x, y] of poly[0]) { w = Math.min(w, x); e = Math.max(e, x); s = Math.min(s, y); n = Math.max(n, y); }
+      list.push({ w, s, e, n, rings: poly });
+    }
+  }
+  iduIndex.n = iduFeatures.size; iduIndex.list = list;
+  return list;
+}
+function nearIdu(p, list, m = 14) {
+  const dx = m / (111320 * Math.cos(p[1] * Math.PI / 180)), dy = m / 110540;
+  for (const q of list) {
+    if (p[0] < q.w - dx || p[0] > q.e + dx || p[1] < q.s - dy || p[1] > q.n + dy) continue;
+    for (const ring of q.rings) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i], [xj, yj] = ring[j];
+        if ((yi > p[1]) !== (yj > p[1]) && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi) inside = !inside;
+        if (proj(p, ring[j], ring[i]).d < m) return true;
+      }
+      if (inside) return true;
+    }
+  }
+  return false;
+}
+async function checkIdu() {
+  const routes = MODE_KEYS.map((k) => S.routes[k]).filter(Boolean);
+  if (!routes.length) return;
+  let w = 180, s = 90, e = -180, n = -90;
+  for (const r of routes) for (const [x, y] of r.coords) { w = Math.min(w, x); e = Math.max(e, x); s = Math.min(s, y); n = Math.max(n, y); }
+  try { await loadIduBox(w, s, e, n); } catch { return; }
+  const list = iduIndex();
+  let found = 0;
+  for (const r of routes) {
+    if (!MODE_KEYS.some((k) => S.routes[k] === r)) continue; // a new search replaced it meanwhile
+    for (const t of tramosOf(r)) {
+      if (t.t !== 'ca' || t.d < 60 || t.idu != null) continue;
+      const len = lineLength(t.coords), k = Math.max(3, Math.min(40, Math.round(len / 25)));
+      let hit = 0;
+      for (let i = 0; i <= k; i++) if (nearIdu(pointAlong(t.coords, i / k), list)) hit++;
+      t.idu = hit / (k + 1) >= 0.6;
+      if (t.idu) found++;
+    }
+  }
+  if (found) {
+    track('idu_mismatch', { n: found });
+    if (['route', 'steps'].includes(S.view) && !N.on) rerender();
+  }
 }
 
 // ---------------------------------------------------------------- places for cyclists (Overpass / OpenStreetMap)
@@ -1444,6 +1710,7 @@ function myPosition(ms = 7000) {
 function openServices(filter) {
   if (filter) SV.filter = filter;
   SV.where = cur() ? 'route' : 'near';
+  track('services_open', { where: SV.where });
   show('services');
   loadServices();
 }
@@ -1507,6 +1774,7 @@ function drawServices(fit) {
   }
 }
 function openPlace(p) {
+  track('place_open', { kind: p.k || null });
   S.current = p;
   show('place');
   S.fit = null;
@@ -1518,6 +1786,25 @@ function applyLayers() {
   const v = S.layers.idu ? 'visible' : 'none';
   for (const id of ['idu-line', 'idu-fill']) if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', v);
   loadIdu(); drawReports();
+}
+
+// ---------------------------------------------------------------- install as an app (PWA)
+// Android/desktop Chrome: a real install prompt. iPhone: instructions (Safari has no prompt).
+let installEvt = null;
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function installBox() {
+  if (standalone()) return '';
+  if (installEvt) return `<div class="installbox"><strong>${L('Instala Bogotá Bici')}</strong><span>${L('Ábrela desde la pantalla de inicio, a pantalla completa y con tus rutas aunque no haya señal.')}</span><button class="btn primary" data-act="install">${L('Instalar app')}</button></div>`;
+  if (isIOS()) return `<div class="installbox"><strong>${L('Instala Bogotá Bici')}</strong><span>${L('En Safari, toca Compartir y luego “Agregar a pantalla de inicio”.')}</span></div>`;
+  return '';
+}
+async function install() {
+  if (!installEvt) return;
+  installEvt.prompt();
+  try { const c = await installEvt.userChoice; track('install', { outcome: c.outcome }); } catch { /* ignore */ }
+  installEvt = null;
+  if (S.view === 'layers') rerender();
 }
 
 // ---------------------------------------------------------------- map
@@ -1627,11 +1914,22 @@ async function init() {
   $('layersBtn').addEventListener('click', () => show(S.view === 'layers' ? (cur() ? 'route' : null) : 'layers'));
   $('reportFab').addEventListener('click', startReport);
   syncReports();
+  track('app_open', { lang: LANG, standalone: standalone(), saved: S.saved.length, shared_link: !!QS.get('a'), w: innerWidth >= 900 ? 'wide' : 'phone' });
+  flushEvents();
+  addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvt = e; if (S.view === 'layers') rerender(); });
+  addEventListener('appinstalled', () => { track('install', { outcome: 'installed' }); installEvt = null; });
+  addEventListener('offline', () => toast(L('Sin conexión. Tus rutas guardadas, los reportes descargados y el mapa ya visto siguen disponibles.'), 5000));
+  // keep street names and pending stats when the app is closed or sent to the background
+  const keep = () => { LS.set('bb_names', [...S.names].slice(-600)); flushEvents(); };
+  addEventListener('pagehide', keep);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') keep(); });
   setInterval(() => { if (document.visibilityState === 'visible') syncReports(); }, 3 * 60e3);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - (S.reportsSynced || 0) > 60e3) syncReports(); });
   addEventListener('online', () => syncReports());
   $('svcBtn').addEventListener('click', () => (S.view === 'services' ? show(cur() ? 'route' : null) : openServices()));
 }
 
+// sw.js: keeps the app, MapLibre and map tiles already seen, so it opens and shows the map without signal
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost') && !SIM) navigator.serviceWorker.register('sw.js').catch(() => { /* not allowed: the app still works online */ });
 if (window.maplibregl) init();
 else document.body.insertAdjacentHTML('beforeend', `<p style="position:fixed;top:40%;left:16px;right:16px;text-align:center">${L('No se pudo cargar el mapa. Revisa tu conexión.')}</p>`);

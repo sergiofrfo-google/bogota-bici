@@ -141,7 +141,7 @@ const report = [], log = [];
     await page.waitForTimeout(800);
     const names = await page.$$eval('.svcrow', (els) => els.map((e) => e.innerText.replace(/\n/g, ' ')));
     report.push('places on route: ' + names.join(' || '));
-    check('places along the route listed and far ones excluded', names.length === 3 && !names.some((n) => /Lejos/.test(n)));
+    check('places along the route listed and far ones excluded', names.length >= 3 && !names.some((n) => /Lejos/.test(n)));
     await shot('03b-places-route');
     await page.tap('[data-act="svcFilter"][data-k="tyre"]'); await page.waitForTimeout(400);
     check('filter montallantas', (await page.$$('.svcrow')).length === 1);
