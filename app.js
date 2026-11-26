@@ -3,7 +3,7 @@
 //   BRouter (routing, OSM way tags, turn hints), Nominatim / Photon (place search and street names),
 //   IDU map server via IDECA (official ciclorruta network), Overpass (bike shops, pumps),
 //   OpenFreeMap (base map, falls back to OSM raster tiles).
-// Community reports are stored in this browser only until a Supabase project exists.
+// Community reports are shared between all riders through a free Supabase project (no account needed).
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -818,14 +818,14 @@ const VIEWS = {
       <div class="cats">${Object.entries(REPORT_TYPES).map(([k, v]) => `<button data-act="cat" data-k="${k}" aria-pressed="${S.draftType === k}">${v.icon}${v.label}</button>`).join('')}</div>
       <div><label class="lbl" for="note">${L('Detalle (opcional)')}</label><textarea id="note" rows="2" maxlength="280" placeholder="${L('Ej.: hueco profundo en el carril sentido sur')}"></textarea></div>
       <button class="btn primary" data-act="publish">${L('Publicar reporte')}</button>
-      <span class="small" style="text-align:center">${L('Por ahora los reportes se guardan solo en este teléfono.')}</span>
+      <span class="small" style="text-align:center">${L('Todos los ciclistas verán tu reporte. No necesitas cuenta.')}</span>
     </div>`,
   reportView: () => {
     const r = S.current, t = REPORT_TYPES[r.type];
     const total = r.still + r.fixed || 1;
     return `<div class="stack">
       <div class="head"><button class="back" data-act="${cur() ? 'backRoute' : 'close'}" aria-label="${L('Volver')}">${ICONS.back}</button>
-        <div><h2>${esc(t.label)}</h2><span class="sub">${L('Reportado {t}', { t: timeAgo(r.created) })}</span></div></div>
+        <div><h2>${esc(t.label)}</h2><span class="sub">${L('Reportado {t}', { t: timeAgo(r.created) })}${r.pending ? ' · ' + L('pendiente de enviar') : ''}</span></div></div>
       ${r.note ? `<p style="margin:0">${esc(r.note)}</p>` : ''}
       <div class="votes"><span>${L('{n} dicen que sigue ahí', { n: `<b>${r.still}</b>` })}</span><span>${L('{n} dicen que ya está arreglado', { n: `<b>${r.fixed}</b>` })}</span></div>
       <div class="vbar"><div style="width:${(r.still / total) * 100}%;background:var(--warn)"></div><div style="width:${(r.fixed / total) * 100}%;background:var(--brand)"></div></div>
@@ -1040,14 +1040,82 @@ function openRoute(A, B, via) {
   computeRoutes();
 }
 
-// ---------------------------------------------------------------- reports (local for now)
-function loadReports() {
-  try { return JSON.parse(localStorage.getItem('bb_reports') || '[]'); } catch { return []; }
+// ---------------------------------------------------------------- reports (shared through Supabase)
+// The publishable key is meant to be public: the database only lets it call list_reports,
+// add_report and vote_report (see supabase/schema.sql), never read or change the tables directly.
+const SB = { url: 'https://xyxalfmyethcsyrurmkf.supabase.co/rest/v1/rpc/', key: 'sb_publishable_lqEWRpuUlZsWYmGzqmSUlQ_lmz2yuEV' };
+// a random id for this phone: one vote per phone per report, and a posting limit per phone
+const DEVICE = (() => {
+  let d = LS.get('bb_device', null);
+  if (!/^[0-9a-f-]{36}$/.test(d || '')) {
+    d = crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = (Math.random() * 16) | 0; return (c === 'x' ? r : (r & 3) | 8).toString(16); });
+    LS.set('bb_device', d);
+  }
+  return d;
+})();
+async function sbCall(fn, body) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const res = await fetch(SB.url + fn, { method: 'POST', signal: ctl.signal, headers: { apikey: SB.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const txt = await res.text();
+    const data = txt ? JSON.parse(txt) : null;
+    if (!res.ok) { const e = new Error(data?.message || res.status); e.status = res.status; throw e; }
+    return data;
+  } finally { clearTimeout(t); }
 }
-function saveReports() { LS.set('bb_reports', S.reports); }
+// shown at once from the last download, then refreshed from the server
+function loadReports() {
+  const myVotes = LS.get('bb_votes', {});
+  return LS.get('bb_reports_cache', []).map((r) => ({ ...r, myVote: myVotes[r.id] || null }))
+    .concat(LS.get('bb_outbox', []).filter((o) => o.kind === 'add').map((o) => o.report));
+}
+function saveReports() {
+  LS.set('bb_reports_cache', S.reports.filter((r) => !r.pending).map(({ myVote, ...r }) => r));
+}
+function remember(id, v) { const m = LS.get('bb_votes', {}); m[id] = v; LS.set('bb_votes', m); }
+// reports and votes wait here while there is no signal, and go out on the next sync
+function queue(item) { const q = LS.get('bb_outbox', []); q.push(item); LS.set('bb_outbox', q); }
+let syncing = false;
+async function syncReports() {
+  if (syncing) return; syncing = true;
+  try {
+    // reports this phone made before sharing existed are sent once
+    const old = LS.get('bb_reports', null);
+    if (Array.isArray(old)) {
+      for (const r of old) if (r.myVote !== 'fixed' && Date.now() - r.created < 30 * 864e5 && REPORT_TYPES[r.type]) queue({ kind: 'add', report: { ...r, pending: true } });
+      try { localStorage.removeItem('bb_reports'); } catch { /* ignore */ }
+    }
+    const q = LS.get('bb_outbox', []), left = [];
+    for (const o of q) {
+      try {
+        if (o.kind === 'add') {
+          const r = o.report;
+          const id = await sbCall('add_report', { p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE });
+          remember(id, 'still');
+        } else if (!String(o.id).startsWith('r')) {
+          await sbCall('vote_report', { p_report: o.id, p_vote: o.vote, p_device: DEVICE });
+        }
+      } catch (e) {
+        // no signal or server busy: try again later; anything else (e.g. outside Bogotá) is dropped
+        if (!e.status || e.status >= 500 || /rate_limited/.test(e.message)) left.push(o);
+      }
+    }
+    LS.set('bb_outbox', left);
+    const myVotes = LS.get('bb_votes', {});
+    const rows = await sbCall('list_reports');
+    const pend = left.filter((o) => o.kind === 'add').map((o) => o.report);
+    S.reports = rows.map((x) => ({ id: x.id, type: REPORT_TYPES[x.type] ? x.type : 'other', note: x.note || '', lat: x.lat, lng: x.lng, created: Date.parse(x.created_at), still: x.still, fixed: x.fixed, myVote: myVotes[x.id] || null })).concat(pend);
+    S.reportsSynced = Date.now();
+    saveReports(); drawReports();
+    if (['route', 'reportView', 'home'].includes(S.view)) {
+      if (S.view === 'reportView' && S.current) S.current = S.reports.find((r) => r.id === S.current.id) || S.current;
+      rerender();
+    }
+  } catch { /* offline: keep showing the last download */ } finally { syncing = false; }
+}
 function activeReports() {
-  const month = 30 * 864e5;
-  return S.reports.filter((r) => !(r.fixed >= 3 && r.fixed > r.still) && Date.now() - r.created < month);
+  const days60 = 60 * 864e5;
+  return S.reports.filter((r) => !(r.fixed >= 3 && r.fixed > r.still) && Date.now() - r.created < days60);
 }
 function reportsNear(route) {
   if (!route) return [];
@@ -1073,18 +1141,31 @@ function pinY() {
   return Math.round((top + bottom) / 2);
 }
 function placePin() { if (S.view === 'report') { $('placePin').style.top = pinY() + 'px'; $('placePin').style.left = (wide() ? (innerWidth + 450) / 2 : innerWidth / 2) + 'px'; } }
-function publishReport() {
+async function publishReport() {
   const c = map.unproject([wide() ? (innerWidth + 450) / 2 : innerWidth / 2, pinY()]);
-  const r = { id: 'r' + Date.now(), type: S.draftType, note: ($('note')?.value || '').trim(), lng: c.lng, lat: c.lat, created: Date.now(), still: 1, fixed: 0, myVote: 'still' };
-  S.reports.push(r); saveReports(); drawReports();
-  toast(L('Reporte publicado. ¡Gracias!'));
+  const r = { id: 'r' + Date.now(), type: S.draftType, note: ($('note')?.value || '').trim().slice(0, 280), lng: c.lng, lat: c.lat, created: Date.now(), still: 1, fixed: 0, myVote: 'still' };
+  if (r.lat < BBOX.s || r.lat > BBOX.n || r.lng < BBOX.w || r.lng > BBOX.e) { toast(L('Solo se pueden reportar sitios en Bogotá.')); return; }
+  S.reports.push(r); drawReports();
   show(cur() ? 'route' : null);
+  try {
+    const id = await sbCall('add_report', { p_type: r.type, p_note: r.note || null, p_lat: r.lat, p_lng: r.lng, p_device: DEVICE });
+    r.id = id; remember(id, 'still'); saveReports(); drawReports();
+    toast(L('Reporte publicado. Todos los ciclistas lo verán. ¡Gracias!'));
+  } catch (e) {
+    if (/rate_limited/.test(e.message)) { S.reports.splice(S.reports.indexOf(r), 1); drawReports(); toast(L('Has enviado muchos reportes seguidos. Intenta más tarde.')); return; }
+    if (e.status && e.status < 500) { S.reports.splice(S.reports.indexOf(r), 1); drawReports(); toast(L('No se pudo publicar el reporte.')); return; }
+    r.pending = true; queue({ kind: 'add', report: r });
+    toast(L('Sin señal: tu reporte se enviará cuando vuelva la conexión.'), 5000);
+  }
 }
 function openReport(r) { if (!r) return; S.current = r; show('reportView'); S.fit = null; map.easeTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 15) }); }
 function vote(v) {
   const r = S.current;
   if (r.myVote) return;
-  r[v] += 1; r.myVote = v; saveReports(); drawReports(); rerender();
+  r[v] += 1; r.myVote = v; remember(r.id, v); saveReports(); drawReports(); rerender();
+  if (r.pending) return; // its "still there" goes with the report itself
+  sbCall('vote_report', { p_report: r.id, p_vote: v, p_device: DEVICE })
+    .catch((e) => { if (!e.status || e.status >= 500) queue({ kind: 'vote', id: r.id, vote: v }); });
 }
 function drawReports() {
   markers.reports.forEach((m) => m.remove()); markers.reports = [];
@@ -1538,6 +1619,10 @@ async function init() {
   $('locateBtn').addEventListener('click', () => { S.fit = null; geoCtl.trigger(); });
   $('layersBtn').addEventListener('click', () => show(S.view === 'layers' ? (cur() ? 'route' : null) : 'layers'));
   $('reportFab').addEventListener('click', startReport);
+  syncReports();
+  setInterval(() => { if (document.visibilityState === 'visible') syncReports(); }, 3 * 60e3);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - (S.reportsSynced || 0) > 60e3) syncReports(); });
+  addEventListener('online', () => syncReports());
   $('svcBtn').addEventListener('click', () => (S.view === 'services' ? show(cur() ? 'route' : null) : openServices()));
 }
 
