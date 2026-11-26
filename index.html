@@ -7,7 +7,9 @@
   <title>Bogotá Bici</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
-  <link rel="apple-touch-icon" href="icon.svg" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Bogotá Bici" />
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
   <link rel="stylesheet" href="style.css" />
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -89,6 +91,8 @@
       </div>
       <div id="navNext" class="navnext" hidden></div>
     </div>
+    <!-- reports on the route: a small silent line, never spoken -->
+    <div id="navAlert" class="navalert" hidden role="status"></div>
     <button id="navRecenter" class="pill-btn float" hidden data-i18n="Centrar">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l7 19-7-4-7 4 7-19z"/></svg> Centrar
     </button>
