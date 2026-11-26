@@ -2,7 +2,7 @@
 // The app reads this file instead of asking Overpass on every search: the free public Overpass servers are
 // often overloaded and can take a minute or refuse, which left "Talleres y aire" empty.
 // Run: node scripts/fetch-places.mjs   (a GitHub Action runs it every week, see .github/workflows/places.yml)
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 
 const BBOX = '4.45,-74.25,4.85,-73.98'; // Bogotá and the next towns (Chía, Soacha, Funza, Mosquera, La Calera)
 const Q = `[out:json][timeout:180][bbox:${BBOX}];(nwr[shop~"^(bicycle|tyres)$"];nwr[amenity~"^(bicycle_repair_station|compressed_air)$"];nwr["service:bicycle:repair"="yes"];nwr["service:bicycle:pump"="yes"];nwr[craft=tyre];);out center tags;`;
@@ -42,5 +42,6 @@ for (const e of j.elements) {
 }
 elements.sort((a, b) => (a.type + a.id).localeCompare(b.type + b.id));
 const out = { generated: j.osm3s?.timestamp_osm_base || new Date().toISOString(), source: 'OpenStreetMap contributors (ODbL), via Overpass API', elements };
+mkdirSync(new URL('../data/', import.meta.url), { recursive: true });
 writeFileSync(new URL('../data/places.json', import.meta.url), JSON.stringify(out) + '\n');
 console.log('saved', elements.length, 'places, OSM data from', out.generated);
