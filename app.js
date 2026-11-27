@@ -659,13 +659,15 @@ async function useMyLocation(which = 'A', quiet = false) {
   hideSuggest();
   if (!navigator.geolocation) { if (!quiet) toast(L('Tu navegador no permite ubicación.')); return false; }
   if (!quiet) toast(L('Buscando tu ubicación…'));
+  const inp = $(INPUT[which]), typed0 = inp.value;
   let ll = null;
   try { ll = await getPos(true, 8000); } catch (e) {
     if (e?.code === 1) { if (!quiet) toast(L('Bloqueaste la ubicación para esta página. Actívala en los permisos del navegador (el candado junto a la dirección).'), 6000); return false; }
     try { ll = await getPos(false, 8000); } catch { /* below */ }
   }
   if (!ll) { if (!quiet) toast(L('No pude obtener tu ubicación. Revisa los permisos.')); return false; }
-  if (quiet && S[which]) return false; // the rider picked a point while we waited
+  // the rider picked a point or started typing while we waited: keep theirs
+  if (quiet && (S[which] || inp.value !== typed0 || document.activeElement === inp)) return false;
   document.activeElement?.blur?.();
   const other = which === 'A' ? S.B : S.A;
   if (!other) map.flyTo({ center: [ll.lng, ll.lat], zoom: 15 });
