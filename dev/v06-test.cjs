@@ -201,7 +201,7 @@ async function newPage(b, opts = {}) {
       res.end(fs.readFileSync(f));
     }).listen(8765);
     const { ctx, page } = await newPage(b, { serviceWorkers: 'allow' });
-    await ctx.route(/unpkg\.com|brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass/, router);
+    await ctx.route(/unpkg\.com|brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass|mail\.ru/, router);
     await page.goto(`http://localhost:8765/?a=${A}&b=${B}&nostats=1`);
     await page.waitForSelector('.chips', { timeout: 90000 });
     await page.evaluate(async () => { await navigator.serviceWorker.ready; });
@@ -212,8 +212,8 @@ async function newPage(b, opts = {}) {
     check('service worker controls the page and saved the app', ctl && /bb-app-/.test(cached) && /bb-routes/.test(cached), cached);
     srv.close();
     await ctx.setOffline(true);
-    await ctx.unroute(/unpkg\.com|brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass/);
-    await ctx.route(/brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass/, (r) => r.abort('internetdisconnected'));
+    await ctx.unroute(/unpkg\.com|brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass|mail\.ru/);
+    await ctx.route(/brouter|nominatim|supabase|serviciosgis|openfreemap|openstreetmap|komoot|overpass|mail\.ru/, (r) => r.abort('internetdisconnected'));
     await page.reload();
     await page.waitForSelector('.chips', { timeout: 60000 }).catch(() => {});
     const off = await page.evaluate(() => ({ map: !!window.map, view: S.view, chips: document.querySelector('.chips')?.innerText.replace(/\n/g, ' | ') || '', toast: $('toast').hidden ? '' : $('toast').innerText }));

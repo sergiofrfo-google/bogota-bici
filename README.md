@@ -29,7 +29,7 @@ A static site: no build step, no server, no API keys. Open `index.html` through 
 | Base map | OpenFreeMap, falling back to OpenStreetMap raster tiles |
 | Place search | Photon and Nominatim |
 | Official ciclorruta network | IDU via IDECA map server (CC BY 4.0) |
-| Bike shops and pumps | OpenStreetMap via Overpass |
+| Bike shops and pumps | OpenStreetMap via Overpass, saved weekly to `data/places.json` by `.github/workflows/places.yml` (live Overpass only as a fallback) |
 
 Reports are shared between all riders through a free Supabase project (`bogota-bici`). Riders need no account:
 each phone keeps a random id that allows one vote per report and limits posting (10 reports and 60 votes per hour per phone,

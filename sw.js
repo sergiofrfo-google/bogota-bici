@@ -5,7 +5,7 @@
 // - Map style, tiles, fonts and icons (OpenFreeMap, OSM): the saved copy is shown at once and refreshed
 //   in the background; at most ~2500 tiles are kept.
 // Everything else (routes, reports, search, stats) goes straight to the network: the app handles those.
-const VERSION = 'bb-v0.6.0';
+const VERSION = 'bb-v0.6.1';
 const APP = 'bb-app-' + VERSION, LIB = 'bb-lib', MAP = 'bb-map';
 const SHELL = ['./', 'index.html', 'app.js', 'i18n.js', 'style.css', 'icon.svg', 'icon-192.png', 'icon-512.png', 'manifest.webmanifest'];
 const LIBS = ['https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js', 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css'];
@@ -16,6 +16,7 @@ self.addEventListener('install', (e) => {
   e.waitUntil((async () => {
     const app = await caches.open(APP);
     await app.addAll(SHELL);
+    try { await app.add('data/places.json'); } catch { /* fetched on first use */ }
     const lib = await caches.open(LIB);
     for (const u of LIBS) if (!(await lib.match(u))) { try { await lib.add(u); } catch { /* next time */ } }
     await self.skipWaiting();

@@ -29,7 +29,7 @@ const report = [], log = [];
       const f = path.join(ML, path.basename(u.pathname));
       return route.fulfill({ status: 200, body: fs.readFileSync(f), headers: { 'content-type': types[path.extname(f)] } });
     }
-    if (/overpass/.test(u.host)) { // Overpass isn't reachable from the test machine: answer with a small fixture
+    if (/overpass|mail\.ru/.test(u.host)) { // Overpass isn't reachable from the test machine: answer with a small fixture
       const el = (id, lat, lon, tags) => ({ type: 'node', id, lat, lon, tags });
       return route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify({ elements: [
         el(1, 4.7178, -74.0372, { shop: 'bicycle', name: 'Taller cerca de A', opening_hours: 'Mo-Sa 08:00-18:00' }),

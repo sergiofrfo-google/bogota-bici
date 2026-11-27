@@ -109,6 +109,7 @@ function toast(msg, ms = 3500) {
 async function fetchT(url, opts = {}, ms = 15000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), ms);
+  if (opts.signal) opts.signal.addEventListener('abort', () => c.abort(), { once: true }); // caller can cancel too
   try { return await fetch(url, { ...opts, signal: c.signal }); } finally { clearTimeout(t); }
 }
 function dist(a, b) {
@@ -1681,7 +1682,19 @@ const SVC = {
   air: { get label() { return L('Aire'); }, get one() { return L('Aire / bomba'); }, icon: ICONS.pump, cls: 'air' },
   tyre: { get label() { return L('Montallantas'); }, get one() { return L('Montallanta'); }, icon: ICONS.tyre, cls: 'tyre' },
 };
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+// Public Overpass servers are often overloaded (overpass-api.de answers "at capacity" or takes a minute),
+// so ask all of them at once and use the first good answer. Answers are kept for a day on the phone.
+const OVERPASS = ['https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const SVC_TTL = 24 * 3600e3;
+// Main source: a snapshot of every place in Bogotá shipped with the app (data/places.json, refreshed weekly
+// by a GitHub Action). Live Overpass is only a fallback if that file can't be read.
+let placesFile = null;
+function placesSnapshot() {
+  placesFile = placesFile || fetchT('data/places.json', {}, 15000).then((r) => { if (!r.ok) throw new Error('places ' + r.status); return r.json(); })
+    .then((j) => { if (!Array.isArray(j.elements) || !j.elements.length) throw new Error('places empty'); return j; })
+    .catch((e) => { placesFile = null; throw e; });
+  return placesFile;
+}
 const SV = { filter: 'all', where: 'near', list: [], loading: false, error: '', center: null, key: '' };
 function svcKind(t) {
   if (t.shop === 'bicycle' || t['service:bicycle:repair'] === 'yes') return 'repair';
@@ -1690,15 +1703,26 @@ function svcKind(t) {
   return 'air';
 }
 async function overpass(q) {
-  let last;
-  for (const u of OVERPASS) {
-    try {
-      const r = await fetchT(u, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 25000);
-      if (r.ok) return await r.json();
-      last = new Error('Overpass ' + r.status);
-    } catch (e) { last = e; }
-  }
-  throw last;
+  const ctl = new AbortController();
+  const one = async (u) => {
+    const r = await fetchT(u, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctl.signal }, 45000);
+    if (!r.ok) throw new Error('Overpass ' + r.status);
+    const j = await r.json();
+    if (!Array.isArray(j.elements) || (j.remark && /error|timed out|runtime/i.test(j.remark) && !j.elements.length)) throw new Error('Overpass ' + (j.remark || 'bad answer'));
+    return j;
+  };
+  try { return await Promise.any(OVERPASS.map(one)); }
+  catch (e) { throw (e.errors && e.errors[0]) || e; }
+  finally { ctl.abort(); }
+}
+function svcCache(key, val) {
+  const all = LS.get('bb_places', {});
+  const now = Date.now();
+  if (val === undefined) { const c = all[key]; return c && now - c.t < SVC_TTL ? c.j : null; }
+  for (const k of Object.keys(all)) if (now - all[k].t >= SVC_TTL) delete all[k];
+  const keys = Object.keys(all); while (keys.length >= 8) delete all[keys.shift()];
+  all[key] = { t: now, j: val };
+  try { LS.set('bb_places', all); } catch { /* full: skip */ }
 }
 function myPosition(ms = 7000) {
   return new Promise((ok) => {
@@ -1721,18 +1745,28 @@ async function loadServices() {
   if (S.view === 'services') rerender();
   const key = Math.random().toString(36);
   SV.key = key;
-  let area, ref = null;
+  let box, ref = null;
   if (where === 'route') {
     const b = new maplibregl.LngLatBounds(); r.coords.forEach((c) => b.extend(c));
-    area = `(${(b.getSouth() - 0.004).toFixed(4)},${(b.getWest() - 0.004).toFixed(4)},${(b.getNorth() + 0.004).toFixed(4)},${(b.getEast() + 0.004).toFixed(4)})`;
+    box = [b.getSouth() - 0.004, b.getWest() - 0.004, b.getNorth() + 0.004, b.getEast() + 0.004];
   } else {
     ref = (await myPosition()) || map.getCenter().toArray();
     SV.center = ref;
-    area = `(around:3000,${ref[1].toFixed(5)},${ref[0].toFixed(5)})`;
+    const dy = 0.027, dx = 0.027 / Math.cos(ref[1] * Math.PI / 180); // about 3 km
+    box = [ref[1] - dy, ref[0] - dx, ref[1] + dy, ref[0] + dx];
   }
-  const q = `[out:json][timeout:25];(nwr["shop"="bicycle"]${area};nwr["service:bicycle:repair"="yes"]${area};nwr["amenity"="bicycle_repair_station"]${area};nwr["amenity"="compressed_air"]${area};nwr["service:bicycle:pump"="yes"]${area};nwr["shop"="tyres"]${area};nwr["craft"="tyre"]${area};);out center 400;`;
+  // rounded so nearby searches share the cached answer
+  const bbox = box.map((v, i) => (i < 2 ? Math.floor(v * 200) : Math.ceil(v * 200)) / 200).map((v) => v.toFixed(3)).join(',');
+  const q = `[out:json][timeout:25][bbox:${bbox}];(nwr[shop~"^(bicycle|tyres)$"];nwr[amenity~"^(bicycle_repair_station|compressed_air)$"];nwr["service:bicycle:repair"="yes"];nwr["service:bicycle:pump"="yes"];nwr[craft=tyre];);out center 400;`;
   try {
-    const j = await overpass(q);
+    let j = null;
+    try {
+      const all = await placesSnapshot();
+      const [s0, w0, n0, e0] = box;
+      j = { elements: all.elements.filter((el) => el.lat >= s0 && el.lat <= n0 && el.lon >= w0 && el.lon <= e0) };
+    } catch (e) { console.warn('places snapshot', e); }
+    if (!j) j = svcCache(bbox);
+    if (!j) { j = await overpass(q); svcCache(bbox, { elements: j.elements }); }
     if (SV.key !== key) return;
     const seen = new Set();
     let list = [];
@@ -1747,7 +1781,7 @@ async function loadServices() {
         const s2 = snapTo(r, [lng, lat], 0);
         if (s2.d > 300) continue;
         p.off = s2.d; p.at = s2.along;
-      } else p.d = dist(ref, [lng, lat]);
+      } else { p.d = dist(ref, [lng, lat]); if (p.d > 3500) continue; }
       list.push(p);
     }
     list.sort((a, b) => (where === 'route' ? a.at - b.at : a.d - b.d));
