@@ -74,6 +74,8 @@ const EN = {
   'Punto en el mapa': 'Point on the map',
   'Punto de paso': 'Stop',
   'Mi ubicación': 'My location',
+  'Usar el GPS del teléfono': 'Use the phone’s GPS',
+  'Bloqueaste la ubicación para esta página. Actívala en los permisos del navegador (el candado junto a la dirección).': 'Location is blocked for this page. Turn it on in the browser’s site settings (the icon next to the address).',
   'Ahora elige el destino: búscalo o toca el mapa.': 'Now choose the destination: search for it or tap the map.',
   'Ahora elige el origen.': 'Now choose the start.',
   'Elige primero el origen y el destino.': 'Choose the start and destination first.',
