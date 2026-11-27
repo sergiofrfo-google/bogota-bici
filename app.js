@@ -258,6 +258,15 @@ function parseRoute(gj) {
   };
 }
 const rTime = (r) => r.time * pace();
+// Among all routes found, "fast" = least time and "infra" = most car-free share (ties keep the profile's own route).
+function pickBest(got) {
+  if (!got.length) return;
+  const byTime = [...got].sort((a, b) => a.time - b.time || (a.src.mode === 'fast' ? -1 : 1))[0];
+  if (!S.routes.fast || byTime.time < S.routes.fast.time) S.routes.fast = byTime;
+  if (S.routes.fast.src.mode === 'fast') S.alt.fast = S.routes.fast.src.alt;
+  const byCarFree = [...got].sort((a, b) => b.noCars - a.noCars || (a.src.mode === 'infra' ? -1 : 1))[0];
+  if (!S.routes.infra || byCarFree.noCars > S.routes.infra.noCars) S.routes.infra = byCarFree;
+}
 
 async function computeRoutes() {
   if (!S.A || !S.B) return;
@@ -267,8 +276,16 @@ async function computeRoutes() {
   S.fromCache = false;
   drawRoutes();
   show('loading');
-  const res = await Promise.allSettled(MODE_KEYS.map((k) => brouter(MODES[k].profile, wp())));
-  res.forEach((r, i) => { if (r.status === 'fulfilled') S.routes[MODE_KEYS[i]] = r.value; });
+  // BRouter's profiles minimise their own "cost", not travel time, so "fastbike" is not always the quickest
+  // (e.g. it can take a longer road that it rates better). Ask for one extra fastbike alternative and then
+  // show as "Más rápida" the quickest of every route we got, and as "Más ciclorruta" the one with most
+  // car-free km. That way the Fastest card is never slower than the other two.
+  const jobs = [...MODE_KEYS.map((k) => [k, MODES[k].profile, 0]), ['fast', MODES.fast.profile, 1]];
+  const res = await Promise.allSettled(jobs.map(([, profile, alt]) => brouter(profile, wp(), alt)));
+  const got = [];
+  res.forEach((r, i) => { if (r.status === 'fulfilled') { r.value.src = { mode: jobs[i][0], alt: jobs[i][2] }; got.push(r.value); } });
+  for (const k of MODE_KEYS) S.routes[k] = got.find((r) => r.src.mode === k && r.src.alt === 0) || null;
+  pickBest(got);
   if (!MODE_KEYS.some((k) => S.routes[k])) {
     console.error(res);
     const offline = res.some((r) => r.reason?.offline);
@@ -422,14 +439,14 @@ function makeMarker(which, p) {
   m.on('dragend', () => setPoint(which, m.getLngLat()));
   markers[which] = m;
 }
-function setPoint(which, lngLat, label) {
+function setPoint(which, lngLat, label, quiet = false) {
   S[which] = { lng: lngLat.lng, lat: lngLat.lat, label: label || L('Punto en el mapa') };
   makeMarker(which, S[which]);
   $(which === 'A' ? 'from' : 'to').value = S[which].label;
   if (!label) reverseName(lngLat).then((n) => { if (n && S[which] && S[which].lng === lngLat.lng) { S[which].label = n; $(which === 'A' ? 'from' : 'to').value = n; } });
   document.body.classList.toggle('has-route', !!(S.A && S.B));
   if (S.A && S.B) computeRoutes();
-  else toast(which === 'A' ? L('Ahora elige el destino: búscalo o toca el mapa.') : L('Ahora elige el origen.'));
+  else if (!quiet) toast(which === 'A' ? L('Ahora elige el destino: búscalo o toca el mapa.') : L('Ahora elige el origen.'));
 }
 function clearAll() {
   for (const w of ['A', 'B']) { if (markers[w]) markers[w].remove(); markers[w] = null; S[w] = null; }
@@ -631,14 +648,38 @@ function drawVia() {
 // ---------------------------------------------------------------- search
 let suggestFor = null, suggestTimer = null;
 const INPUT = { A: 'from', B: 'to', V: 'via' };
+// Current GPS position as origin (or destination). Tries a precise fix first, then a quick rough one,
+// so it still works indoors or when the GPS is slow.
+function getPos(precise, ms) {
+  return new Promise((ok, fail) => navigator.geolocation.getCurrentPosition(
+    (p) => ok({ lng: p.coords.longitude, lat: p.coords.latitude }), fail,
+    precise ? { enableHighAccuracy: true, timeout: ms, maximumAge: 30000 } : { enableHighAccuracy: false, timeout: ms, maximumAge: 300000 }));
+}
+async function useMyLocation(which = 'A', quiet = false) {
+  hideSuggest();
+  if (!navigator.geolocation) { if (!quiet) toast(L('Tu navegador no permite ubicación.')); return false; }
+  if (!quiet) toast(L('Buscando tu ubicación…'));
+  let ll = null;
+  try { ll = await getPos(true, 8000); } catch (e) {
+    if (e?.code === 1) { if (!quiet) toast(L('Bloqueaste la ubicación para esta página. Actívala en los permisos del navegador (el candado junto a la dirección).'), 6000); return false; }
+    try { ll = await getPos(false, 8000); } catch { /* below */ }
+  }
+  if (!ll) { if (!quiet) toast(L('No pude obtener tu ubicación. Revisa los permisos.')); return false; }
+  if (quiet && S[which]) return false; // the rider picked a point while we waited
+  document.activeElement?.blur?.();
+  const other = which === 'A' ? S.B : S.A;
+  if (!other) map.flyTo({ center: [ll.lng, ll.lat], zoom: 15 });
+  setPoint(which, ll, L('Mi ubicación'), quiet);
+  return true;
+}
 function wireSearch() {
   for (const [which, id] of Object.entries(INPUT)) {
     const inp = $(id);
-    inp.addEventListener('focus', () => { inp.select(); if (!$('sheet').hidden && !wide()) setSnap('peek'); });
+    inp.addEventListener('focus', () => { inp.select(); if (!$('sheet').hidden && !wide()) setSnap('peek'); if (which === 'A') showSuggest(which, []); });
     inp.addEventListener('input', () => {
       clearTimeout(suggestTimer);
       const q = inp.value.trim();
-      if (q.length < 3) { hideSuggest(); return; }
+      if (q.length < 3) { if (which === 'A') showSuggest(which, []); else hideSuggest(); return; }
       suggestTimer = setTimeout(() => photon(q, which), 400);
     });
   }
@@ -655,15 +696,18 @@ function wireSearch() {
   for (const [which, id] of Object.entries(INPUT)) $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); go(which); } });
   $('suggest').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-i]');
-    if (b) pickPlace(suggestFor.which, suggestFor.list[+b.dataset.i]);
+    if (b?.dataset.i === 'gps') useMyLocation(suggestFor.which);
+    else if (b) pickPlace(suggestFor.which, suggestFor.list[+b.dataset.i]);
   });
   document.addEventListener('click', (e) => { if (!e.target.closest('#search')) hideSuggest(); });
 }
 function hideSuggest() { $('suggest').hidden = true; }
 function showSuggest(which, list) {
   suggestFor = { which, list };
-  $('suggest').innerHTML = list.map((p, i) => `<li><button type="button" data-i="${i}"><strong>${esc(p.name)}</strong><span>${esc(p.sub)}</span></button></li>`).join('');
-  $('suggest').hidden = !list.length;
+  // the origin field always offers "my location" first
+  const gps = which !== 'A' ? '' : `<li><button type="button" data-i="gps" class="gpsrow">${ICONS.locate}<span><strong>${L('Mi ubicación')}</strong><span>${L('Usar el GPS del teléfono')}</span></span></button></li>`;
+  $('suggest').innerHTML = gps + list.map((p, i) => `<li><button type="button" data-i="${i}"><strong>${esc(p.name)}</strong><span>${esc(p.sub)}</span></button></li>`).join('');
+  $('suggest').hidden = !gps && !list.length;
 }
 async function photon(q, which) {
   try {
@@ -1900,6 +1944,9 @@ async function init() {
     const via = vpts.length ? { label: QS.get('vn') || L('Punto de paso'), street: QS.get('vs') === '1', pts: vpts } : null;
     if (a && b) openRoute({ ...a, label: QS.get('an') || L('Origen') }, { ...b, label: QS.get('bn') || L('Destino') }, via);
     else if (S.saved.length) show('home');
+    // If the rider already allowed location for this page, start from where they are (like other map apps);
+    // we never trigger the permission prompt on our own, only from the "my location" buttons.
+    if (!(a && b) && !SIM) navigator.permissions?.query({ name: 'geolocation' }).then((st) => { if (st.state === 'granted' && !S.A) useMyLocation('A', true); }).catch(() => {});
   });
   map.on('click', (e) => {
     if (e.defaultPrevented || S.view === 'report' || N.on) return;
@@ -1935,15 +1982,7 @@ async function init() {
     $('from').value = S.A?.label || ''; $('to').value = S.B?.label || '';
     if (S.A && S.B) computeRoutes();
   });
-  $('gps').addEventListener('click', () => {
-    if (!navigator.geolocation) return toast(L('Tu navegador no permite ubicación.'));
-    toast(L('Buscando tu ubicación…'));
-    navigator.geolocation.getCurrentPosition(
-      (p) => { const ll = { lng: p.coords.longitude, lat: p.coords.latitude }; if (!S.B) map.flyTo({ center: [ll.lng, ll.lat], zoom: 15 }); setPoint('A', ll, L('Mi ubicación')); },
-      () => toast(L('No pude obtener tu ubicación. Revisa los permisos.')),
-      { enableHighAccuracy: true, timeout: 10000 },
-    );
-  });
+  $('gps').addEventListener('click', () => useMyLocation('A'));
   $('locateBtn').addEventListener('click', () => { S.fit = null; geoCtl.trigger(); });
   $('layersBtn').addEventListener('click', () => show(S.view === 'layers' ? (cur() ? 'route' : null) : 'layers'));
   $('reportFab').addEventListener('click', startReport);
